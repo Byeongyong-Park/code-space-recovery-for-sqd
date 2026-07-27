@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77.0.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "code-space-recovery-for-sqd"
+version = "1.0.0"
+description = "Code-space recovery for sample-based quantum diagonalization"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Byeongyong Park" },
+    { name = "Sanha Kang" },
+    { name = "Doyeol Ahn" },
+    { name = "Keunhong Jeong" },
+]
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "numpy",
+    "scipy",
+    "numba",
+    "primme",
+    "qiskit",
+    "stepmix",
+    "joblib",
+]
+
+[project.optional-dependencies]
+hardware = [
+    "qiskit-ibm-runtime",
+    "mthree",
+]
+
+[project.urls]
+Repository = "https://github.com/Byeongyong-Park/code-space-recovery-for-sqd"
+Paper = "https://arxiv.org/abs/2607.10227"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["code_space_recovery*"]

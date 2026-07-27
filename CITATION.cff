@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the article in preferred-citation."
+title: "Code-space recovery for SQD"
+type: software
+version: "1.0.0"
+license: MIT
+repository-code: "https://github.com/Byeongyong-Park/code-space-recovery-for-sqd"
+authors:
+  - given-names: "Byeongyong"
+    family-names: "Park"
+  - given-names: "Sanha"
+    family-names: "Kang"
+  - given-names: "Doyeol"
+    family-names: "Ahn"
+  - given-names: "Keunhong"
+    family-names: "Jeong"
+preferred-citation:
+  type: article
+  title: "Code-space recovery for sample-based quantum diagonalization beyond native symmetry constraints"
+  authors:
+    - given-names: "Byeongyong"
+      family-names: "Park"
+    - given-names: "Sanha"
+      family-names: "Kang"
+    - given-names: "Doyeol"
+      family-names: "Ahn"
+    - given-names: "Keunhong"
+      family-names: "Jeong"
+  year: 2026
+  doi: "10.48550/arXiv.2607.10227"
+  url: "https://arxiv.org/abs/2607.10227"

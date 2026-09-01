@@ -7,15 +7,18 @@ diagonalization (SQD). It provides reusable methods associated with the paper.
 ## Versions and reproducibility
 
 The Zenodo deposit accompanying the article is the **authoritative, immutable
-paper snapshot**. Use that archive for exact reproduction of the reported
-results, including the archived source, notebooks, inputs, and result tables.
+paper snapshot** ([DOI](https://doi.org/10.5281/zenodo.22015275)). Use that
+archive for exact reproduction of the reported results, including the archived
+source, notebooks, inputs, and result tables.
 
-The pre-maintenance GitHub package was labeled `v1.0.0`. Its scientific and
-numerical implementation matches the archived source; the observed file-level
-differences are documentation/comments and non-computational diagnostic text.
-It is therefore computationally aligned with the paper code, although it is
-not a byte-for-byte archival copy. Use Zenodo when the exact deposited files,
-not only the calculation path, are required.
+The pre-maintenance GitHub package is preserved as the
+[`v1.0.0-paper-snapshot`](https://github.com/Byeongyong-Park/code-space-recovery-for-sqd/tree/v1.0.0-paper-snapshot)
+release tag. Its scientific and numerical implementation matches the archived
+source; the observed file-level differences are documentation/comments and
+non-computational diagnostic text. It is therefore computationally aligned
+with the paper code, although it is not a byte-for-byte archival copy. Use
+Zenodo when the exact deposited files, not only the calculation path, are
+required.
 
 The `v2.0.0` package and the current `main` branch are maintained,
 post-study software releases. They clarify the supported encoding convention,

@@ -27,10 +27,14 @@ from typing import Any, Mapping, Sequence
 import math
 import numbers
 import time
-import warnings
 import sys
 
 import numpy as np
+
+try:  # package import
+    from ._version import ALGORITHM_VERSION, PACKAGE_VERSION
+except ImportError:  # pragma: no cover - flat-module compatibility
+    from _version import ALGORITHM_VERSION, PACKAGE_VERSION  # type: ignore
 
 
 def _patch_coverage_for_numba_import() -> None:
@@ -153,6 +157,8 @@ class ProjectedPauliBuildStats:
     relative_residual: float | None = None
     used_warm_start: bool = False
     primme_stats: dict[str, Any] | None = None
+    package_version: str = PACKAGE_VERSION
+    algorithm_version: str = ALGORITHM_VERSION
 
 
 # =============================================================================
@@ -527,23 +533,247 @@ def _as_positive_float(name: str, value: Any) -> float:
     return value
 
 
+def _validate_compiled_pauli_hamiltonian(
+    compiled: CompiledPauliHamiltonian,
+) -> CompiledPauliHamiltonian:
+    """Validate the complete structural contract of a compiled Hamiltonian.
+
+    ``CompiledPauliHamiltonian`` is public and can therefore be constructed or
+    modified independently of :func:`compile_pauli_hamiltonian`. Numerical
+    kernels assume the canonical grouping, dtypes, cached real coefficients,
+    and uint64 mask range produced by the compiler. Validate those assumptions
+    before a caller-supplied compiled object reaches a kernel.
+
+    The validated object is returned unchanged so normal compiler output keeps
+    the same arrays and numerical path.
+    """
+    if not isinstance(compiled, CompiledPauliHamiltonian):
+        raise TypeError("compiled must be a CompiledPauliHamiltonian instance.")
+
+    if isinstance(compiled.num_qubits, (bool, np.bool_)) or not isinstance(
+        compiled.num_qubits,
+        numbers.Integral,
+    ):
+        raise TypeError("Compiled Hamiltonian num_qubits must be an integer, not bool.")
+    num_qubits = int(compiled.num_qubits)
+    if num_qubits < 1 or num_qubits > 63:
+        raise ValueError(
+            "Compiled Hamiltonian num_qubits must be in [1, 63], "
+            f"got {num_qubits}."
+        )
+
+    if isinstance(compiled.n_input_terms, (bool, np.bool_)) or not isinstance(
+        compiled.n_input_terms,
+        numbers.Integral,
+    ):
+        raise TypeError("Compiled Hamiltonian n_input_terms must be an integer, not bool.")
+    if isinstance(compiled.n_compiled_terms, (bool, np.bool_)) or not isinstance(
+        compiled.n_compiled_terms,
+        numbers.Integral,
+    ):
+        raise TypeError(
+            "Compiled Hamiltonian n_compiled_terms must be an integer, not bool."
+        )
+    n_input_terms = int(compiled.n_input_terms)
+    declared_n_terms = int(compiled.n_compiled_terms)
+    if n_input_terms < 0 or declared_n_terms < 0:
+        raise ValueError("Compiled Hamiltonian term counts must be nonnegative.")
+    if declared_n_terms > n_input_terms:
+        raise ValueError(
+            "Compiled Hamiltonian n_compiled_terms cannot exceed n_input_terms."
+        )
+
+    coefficient_cutoff = _as_nonnegative_float(
+        "Compiled Hamiltonian coefficient_cutoff",
+        compiled.coefficient_cutoff,
+    )
+    if not isinstance(compiled.pauli_label_convention, str):
+        raise TypeError("Compiled Hamiltonian pauli_label_convention must be a string.")
+    convention = compiled.pauli_label_convention.lower()
+    if convention not in {
+        "qiskit",
+        "big_endian",
+        "big-endian",
+        "msb",
+        "little",
+        "little_endian",
+        "little-endian",
+        "lsb",
+        "internal",
+    }:
+        raise ValueError(
+            "Compiled Hamiltonian pauli_label_convention must be "
+            "'qiskit' or 'little_endian'."
+        )
+    if not isinstance(compiled.is_real, bool):
+        raise TypeError("Compiled Hamiltonian is_real must be bool.")
+
+    raw_named_arrays = (
+        ("group_x_masks", compiled.group_x_masks),
+        ("group_offsets", compiled.group_offsets),
+        ("term_z_masks", compiled.term_z_masks),
+        ("term_coeffs_complex", compiled.term_coeffs_complex),
+        ("term_coeffs_real", compiled.term_coeffs_real),
+    )
+    for name, array in raw_named_arrays:
+        if not isinstance(array, np.ndarray):
+            raise TypeError(
+                f"Compiled Hamiltonian {name} must be a numpy.ndarray."
+            )
+
+    group_x_masks = np.asarray(compiled.group_x_masks)
+    group_offsets = np.asarray(compiled.group_offsets)
+    term_z_masks = np.asarray(compiled.term_z_masks)
+    term_coeffs_complex = np.asarray(compiled.term_coeffs_complex)
+    term_coeffs_real = np.asarray(compiled.term_coeffs_real)
+
+    named_arrays = (
+        ("group_x_masks", group_x_masks),
+        ("group_offsets", group_offsets),
+        ("term_z_masks", term_z_masks),
+        ("term_coeffs_complex", term_coeffs_complex),
+        ("term_coeffs_real", term_coeffs_real),
+    )
+    for name, array in named_arrays:
+        if array.ndim != 1:
+            raise ValueError(f"Compiled Hamiltonian {name} must be a 1D array.")
+
+    expected_dtypes = (
+        ("group_x_masks", group_x_masks, np.dtype(np.uint64)),
+        ("group_offsets", group_offsets, np.dtype(np.int64)),
+        ("term_z_masks", term_z_masks, np.dtype(np.uint64)),
+        ("term_coeffs_complex", term_coeffs_complex, np.dtype(np.complex128)),
+        ("term_coeffs_real", term_coeffs_real, np.dtype(np.float64)),
+    )
+    for name, array, expected_dtype in expected_dtypes:
+        if array.dtype != expected_dtype:
+            raise TypeError(
+                f"Compiled Hamiltonian {name} must have dtype {expected_dtype}, "
+                f"got {array.dtype}."
+            )
+
+    n_groups = int(group_x_masks.shape[0])
+    n_terms = int(term_coeffs_complex.shape[0])
+    if group_offsets.shape[0] != n_groups + 1:
+        raise ValueError(
+            "Compiled Hamiltonian group_offsets length must equal n_groups + 1."
+        )
+    if term_z_masks.shape[0] != n_terms or term_coeffs_real.shape[0] != n_terms:
+        raise ValueError("Compiled Hamiltonian term arrays have inconsistent lengths.")
+    if declared_n_terms != n_terms:
+        raise ValueError(
+            "Compiled Hamiltonian n_compiled_terms does not match its term arrays."
+        )
+    if int(group_offsets[0]) != 0 or int(group_offsets[-1]) != n_terms:
+        raise ValueError(
+            "Compiled Hamiltonian group_offsets must start at 0 and end at n_terms."
+        )
+    if np.any(group_offsets < 0) or np.any(group_offsets > n_terms):
+        raise ValueError(
+            "Compiled Hamiltonian group_offsets entries must lie within "
+            "[0, n_terms]."
+        )
+    if n_groups == 0:
+        if n_terms != 0:
+            raise ValueError(
+                "Compiled Hamiltonian with terms must contain at least one X-mask group."
+            )
+    elif np.any(np.diff(group_offsets) <= 0):
+        raise ValueError(
+            "Compiled Hamiltonian group_offsets must define nonempty groups in "
+            "strictly increasing order."
+        )
+
+    max_mask = np.uint64((1 << num_qubits) - 1)
+    if (
+        (group_x_masks.size and np.any(group_x_masks > max_mask))
+        or (term_z_masks.size and np.any(term_z_masks > max_mask))
+    ):
+        raise ValueError("Compiled Hamiltonian masks contain bits outside num_qubits.")
+
+    # Compiler output is canonical: X-mask groups and Z masks within each group
+    # are strictly ordered, with duplicate Pauli terms already merged.
+    if group_x_masks.size > 1 and np.any(group_x_masks[1:] <= group_x_masks[:-1]):
+        raise ValueError(
+            "Compiled Hamiltonian group_x_masks must be strictly increasing."
+        )
+    for group_index in range(n_groups):
+        start = int(group_offsets[group_index])
+        stop = int(group_offsets[group_index + 1])
+        group_z_masks = term_z_masks[start:stop]
+        if group_z_masks.size > 1 and np.any(
+            group_z_masks[1:] <= group_z_masks[:-1]
+        ):
+            raise ValueError(
+                "Compiled Hamiltonian term_z_masks must be strictly increasing "
+                f"within group {group_index}."
+            )
+
+    if not np.all(np.isfinite(term_coeffs_complex)):
+        raise ValueError("Compiled Hamiltonian coefficients must be finite.")
+    if not np.all(np.isfinite(term_coeffs_real)):
+        raise ValueError("Compiled Hamiltonian real coefficient cache must be finite.")
+    if not np.array_equal(term_coeffs_real, term_coeffs_complex.real):
+        raise ValueError(
+            "Compiled Hamiltonian real coefficient cache is inconsistent with "
+            "term_coeffs_complex.real."
+        )
+
+    expected_is_real = bool(
+        np.all(np.abs(term_coeffs_complex.imag) <= coefficient_cutoff)
+    )
+    if compiled.is_real != expected_is_real:
+        raise ValueError(
+            "Compiled Hamiltonian is_real is inconsistent with its coefficients "
+            "and coefficient_cutoff."
+        )
+
+    return compiled
+
+
 def _infer_num_qubits(hamiltonian: Any, num_qubits: int | None) -> int:
     explicit = _as_positive_int_or_none("num_qubits", num_qubits)
     if explicit is not None:
         out = explicit
     elif hasattr(hamiltonian, "num_qubits"):
-        out = int(getattr(hamiltonian, "num_qubits"))
+        inferred = _as_positive_int_or_none(
+            "hamiltonian.num_qubits",
+            getattr(hamiltonian, "num_qubits"),
+        )
+        assert inferred is not None
+        out = inferred
     elif hasattr(hamiltonian, "n_qubits"):
-        out = int(getattr(hamiltonian, "n_qubits"))
+        inferred = _as_positive_int_or_none(
+            "hamiltonian.n_qubits",
+            getattr(hamiltonian, "n_qubits"),
+        )
+        assert inferred is not None
+        out = inferred
     else:
         max_q = -1
         for spec, _coeff in _iter_hamiltonian_terms(hamiltonian):
             if isinstance(spec, str):
                 max_q = max(max_q, len(spec) - 1)
             elif isinstance(spec, Mapping):
-                max_q = max(max_q, *(int(q) for q in spec.keys())) if spec else max_q
+                indices = list(spec.keys())
+                if any(
+                    isinstance(q, (bool, np.bool_))
+                    or not isinstance(q, numbers.Integral)
+                    for q in indices
+                ):
+                    raise TypeError(
+                        "Sparse Pauli qubit indices must be integers (not bool)."
+                    )
+                max_q = max(max_q, *(int(q) for q in indices)) if indices else max_q
             else:
                 for q, _p in spec:
+                    if isinstance(q, (bool, np.bool_)) or not isinstance(
+                        q,
+                        numbers.Integral,
+                    ):
+                        raise TypeError(
+                            "Sparse Pauli qubit indices must be integers (not bool)."
+                        )
                     max_q = max(max_q, int(q))
         if max_q < 0:
             raise ValueError("Cannot infer num_qubits from an empty Hamiltonian; pass num_qubits explicitly.")
@@ -554,6 +784,14 @@ def _infer_num_qubits(hamiltonian: Any, num_qubits: int | None) -> int:
     if out > 63:
         raise ValueError(f"This uint64 implementation supports at most 63 qubits. Got {out}.")
     return out
+
+
+def _is_one_shot_hamiltonian_iterator(hamiltonian: Any) -> bool:
+    """Return whether iterating ``hamiltonian`` consumes the object itself."""
+    try:
+        return iter(hamiltonian) is hamiltonian
+    except TypeError:
+        return False
 
 
 def _iter_hamiltonian_terms(hamiltonian: Any) -> list[tuple[Any, complex]]:
@@ -629,6 +867,14 @@ def _parse_sparse_pauli_to_masks(pauli_spec: Any, *, num_qubits: int) -> tuple[i
     z_mask = 0
     seen: set[int] = set()
     for q_raw, op_raw in items:
+        if isinstance(q_raw, (bool, np.bool_)) or not isinstance(
+            q_raw,
+            numbers.Integral,
+        ):
+            raise TypeError(
+                "Sparse Pauli qubit indices must be integers (not bool), "
+                f"got {q_raw!r}."
+            )
         q = int(q_raw)
         if q < 0 or q >= num_qubits:
             raise ValueError(f"Pauli term references qubit {q}, outside [0, {num_qubits}).")
@@ -677,6 +923,114 @@ def _effective_coeff_in_key_formula(x_mask: int, z_mask: int, coeff: complex) ->
     return coeff * phase
 
 
+def _require_finite_hamiltonian_coefficient(
+    coeff: complex,
+    *,
+    context: str,
+) -> None:
+    """Reject NaN and infinite Pauli coefficients before numerical kernels."""
+    if not (math.isfinite(float(coeff.real)) and math.isfinite(float(coeff.imag))):
+        raise ValueError(
+            "Hamiltonian coefficients must be finite. "
+            f"Got {coeff!r} for {context}."
+        )
+
+
+def _reject_duplicate_cutoff_ambiguity(
+    raw_terms: Sequence[tuple[Any, complex]],
+    *,
+    num_qubits: int,
+    coefficient_cutoff: float,
+    pauli_label_convention: str,
+    require_real_pauli_coefficients: bool,
+) -> None:
+    """Reject duplicates for which merge-before-cutoff changes the Hamiltonian.
+
+    The projected diagonalizer historically drops individual terms before
+    merging duplicate Pauli operators, while SqDRIFT historically merges first.
+    Both numerical rules are retained.  Inputs for which those rules produce
+    different canonical coefficients are rejected instead of allowing two
+    modules to evolve and diagonalize different Hamiltonians.
+    """
+    grouped_coefficients: dict[tuple[int, int], list[complex]] = {}
+    representative_specs: dict[tuple[int, int], Any] = {}
+
+    for term_index, (spec, raw_coefficient) in enumerate(raw_terms):
+        coefficient = complex(raw_coefficient)
+        _require_finite_hamiltonian_coefficient(
+            coefficient,
+            context=f"input term index {term_index}, Pauli spec {spec!r}",
+        )
+        x_mask, z_mask = _pauli_spec_to_masks(
+            spec,
+            num_qubits=num_qubits,
+            pauli_label_convention=pauli_label_convention,
+        )
+        key = (int(x_mask), int(z_mask))
+        grouped_coefficients.setdefault(key, []).append(coefficient)
+        representative_specs.setdefault(key, spec)
+
+    for key, coefficients in grouped_coefficients.items():
+        if len(coefficients) < 2:
+            continue
+
+        # SqDRIFT rejects such a group for non-real input independently of the
+        # cutoff-order issue, so it is not a merge-vs-cutoff ambiguity.
+        if any(abs(coefficient.imag) > coefficient_cutoff for coefficient in coefficients):
+            continue
+
+        individually_dropped = False
+        diagonalization_sum = 0.0 + 0.0j
+        sqdrift_sum = 0.0 + 0.0j
+        for coefficient in coefficients:
+            diagonalization_coefficient = (
+                complex(coefficient.real, 0.0)
+                if require_real_pauli_coefficients
+                else coefficient
+            )
+            retained_individually = (
+                abs(coefficient) > coefficient_cutoff
+                and abs(diagonalization_coefficient) > coefficient_cutoff
+            )
+            if retained_individually:
+                diagonalization_sum += diagonalization_coefficient
+            else:
+                individually_dropped = True
+            sqdrift_sum += complex(coefficient.real, 0.0)
+
+        if not individually_dropped:
+            continue
+
+        _require_finite_hamiltonian_coefficient(
+            diagonalization_sum,
+            context=f"duplicate Pauli term {representative_specs[key]!r}",
+        )
+        _require_finite_hamiltonian_coefficient(
+            sqdrift_sum,
+            context=f"duplicate Pauli term {representative_specs[key]!r}",
+        )
+        diagonalization_final = (
+            diagonalization_sum
+            if abs(diagonalization_sum) > coefficient_cutoff
+            else 0.0 + 0.0j
+        )
+        sqdrift_final = (
+            sqdrift_sum
+            if abs(sqdrift_sum) > coefficient_cutoff
+            else 0.0 + 0.0j
+        )
+        if diagonalization_final != sqdrift_final:
+            raise ValueError(
+                "Duplicate Pauli terms are ambiguous at the coefficient cutoff: "
+                f"canonical term {representative_specs[key]!r} would have "
+                f"coefficient {diagonalization_final!r} when individual terms "
+                "are dropped before merging, but coefficient "
+                f"{sqdrift_final!r} when duplicates are merged first. Merge "
+                "duplicate terms explicitly before using diagonalization, "
+                "variance, or SqDRIFT."
+            )
+
+
 def compile_pauli_hamiltonian(
     hamiltonian: Any,
     *,
@@ -687,12 +1041,34 @@ def compile_pauli_hamiltonian(
 ) -> CompiledPauliHamiltonian:
     """Compile a Pauli-sum Hamiltonian into grouped uint64 masks."""
     coefficient_cutoff = _as_nonnegative_float("coefficient_cutoff", coefficient_cutoff)
+    if (
+        num_qubits is None
+        and getattr(hamiltonian, "num_qubits", None) is None
+        and getattr(hamiltonian, "n_qubits", None) is None
+        and _is_one_shot_hamiltonian_iterator(hamiltonian)
+    ):
+        raise ValueError(
+            "num_qubits must be provided explicitly for a one-shot Hamiltonian "
+            "iterator or generator; inferring it would consume the terms before "
+            "compilation."
+        )
     num_qubits = _infer_num_qubits(hamiltonian, num_qubits)
     raw_terms = _iter_hamiltonian_terms(hamiltonian)
+    _reject_duplicate_cutoff_ambiguity(
+        raw_terms,
+        num_qubits=num_qubits,
+        coefficient_cutoff=coefficient_cutoff,
+        pauli_label_convention=pauli_label_convention,
+        require_real_pauli_coefficients=require_real_pauli_coefficients,
+    )
     combined: dict[tuple[int, int], complex] = {}
 
-    for spec, coeff in raw_terms:
+    for term_index, (spec, coeff) in enumerate(raw_terms):
         coeff = complex(coeff)
+        _require_finite_hamiltonian_coefficient(
+            coeff,
+            context=f"input term index {term_index}, Pauli spec {spec!r}",
+        )
         if abs(coeff) <= coefficient_cutoff:
             continue
         if require_real_pauli_coefficients:
@@ -709,10 +1085,25 @@ def compile_pauli_hamiltonian(
         if abs(eff) <= coefficient_cutoff:
             continue
         key = (int(x_mask), int(z_mask))
-        combined[key] = combined.get(key, 0.0 + 0.0j) + eff
+        merged_coeff = combined.get(key, 0.0 + 0.0j) + eff
+        _require_finite_hamiltonian_coefficient(
+            merged_coeff,
+            context=(
+                "merged Pauli term with "
+                f"x_mask={key[0]} and z_mask={key[1]}"
+            ),
+        )
+        combined[key] = merged_coeff
 
     compact_terms: list[tuple[int, int, complex]] = []
     for (x_mask, z_mask), coeff in combined.items():
+        _require_finite_hamiltonian_coefficient(
+            coeff,
+            context=(
+                "merged Pauli term with "
+                f"x_mask={x_mask} and z_mask={z_mask}"
+            ),
+        )
         if abs(coeff) > coefficient_cutoff:
             compact_terms.append((x_mask, z_mask, coeff))
     compact_terms.sort(key=lambda t: (t[0], t[1]))
@@ -761,6 +1152,55 @@ def compile_pauli_hamiltonian(
         n_compiled_terms=len(term_z_masks),
         coefficient_cutoff=coefficient_cutoff,
         pauli_label_convention=pauli_label_convention,
+    )
+
+
+def _require_hermitian_compiled_pauli_hamiltonian(
+    compiled: CompiledPauliHamiltonian,
+    *,
+    context: str,
+) -> None:
+    """Require real coefficients in the canonical Pauli basis."""
+    _validate_compiled_pauli_hamiltonian(compiled)
+    cutoff = float(compiled.coefficient_cutoff)
+    for group_index, x_mask_raw in enumerate(compiled.group_x_masks):
+        x_mask = int(x_mask_raw)
+        start = int(compiled.group_offsets[group_index])
+        stop = int(compiled.group_offsets[group_index + 1])
+        for term_index in range(start, stop):
+            z_mask = int(compiled.term_z_masks[term_index])
+            effective_coefficient = complex(compiled.term_coeffs_complex[term_index])
+            n_y_mod4 = int((x_mask & z_mask).bit_count() % 4)
+            phase = (
+                1.0 + 0.0j,
+                0.0 + 1.0j,
+                -1.0 + 0.0j,
+                0.0 - 1.0j,
+            )[n_y_mod4]
+            pauli_coefficient = effective_coefficient * np.conjugate(phase)
+            if float(pauli_coefficient.imag) != 0.0:
+                raise ValueError(
+                    f"{context} requires a Hermitian Pauli Hamiltonian. The "
+                    "final canonical Pauli coefficient at term "
+                    f"{term_index} is {pauli_coefficient!r}, whose imaginary "
+                    "part is nonzero. Use require_real_pauli_coefficients=True "
+                    f"to canonicalize input noise up to coefficient_cutoff={cutoff}."
+                )
+
+
+def _compiled_pauli_hamiltonians_are_equal(
+    left: CompiledPauliHamiltonian,
+    right: CompiledPauliHamiltonian,
+) -> bool:
+    """Return whether two validated compiled objects represent the same operator."""
+    _validate_compiled_pauli_hamiltonian(left)
+    _validate_compiled_pauli_hamiltonian(right)
+    return bool(
+        int(left.num_qubits) == int(right.num_qubits)
+        and np.array_equal(left.group_x_masks, right.group_x_masks)
+        and np.array_equal(left.group_offsets, right.group_offsets)
+        and np.array_equal(left.term_z_masks, right.term_z_masks)
+        and np.array_equal(left.term_coeffs_complex, right.term_coeffs_complex)
     )
 
 
@@ -868,8 +1308,10 @@ class ProjectedPauliCSRPRIMMEDiagonalizer:
     """Diagonalize one fixed Pauli Hamiltonian in supplied logical subspaces.
 
     The Hamiltonian is compiled at construction. The first argument to
-    :meth:`__call__` is retained for recovery-driver compatibility and is not
-    recompiled. Successful calls update :attr:`last_stats`.
+    :meth:`__call__` is retained for recovery-driver compatibility: the exact
+    construction object follows an identity fast path, while a different
+    object is compiled and required to represent the same Hamiltonian before
+    numerical work begins. Successful calls update :attr:`last_stats`.
     """
 
     def __init__(
@@ -906,6 +1348,13 @@ class ProjectedPauliCSRPRIMMEDiagonalizer:
             coefficient_cutoff=coefficient_cutoff,
             pauli_label_convention=pauli_label_convention,
             require_real_pauli_coefficients=require_real_pauli_coefficients,
+        )
+        _require_hermitian_compiled_pauli_hamiltonian(
+            self.compiled,
+            context="Projected eigsh diagonalization",
+        )
+        self.require_real_pauli_coefficients = bool(
+            require_real_pauli_coefficients
         )
         max_logical_qubits_checked = _as_positive_int_or_none("max_logical_qubits", max_logical_qubits)
         assert max_logical_qubits_checked is not None
@@ -987,19 +1436,37 @@ class ProjectedPauliCSRPRIMMEDiagonalizer:
         """Return the lowest projected Ritz pair for ``logical_basis``.
 
         ``warm_start_keys`` takes precedence over ``warm_start_basis`` when
-        both are supplied. The ``hamiltonian`` argument is compatibility-only;
-        this object always uses the Hamiltonian compiled at construction.
+        both are supplied. The ``hamiltonian`` argument must be the construction
+        object or a separately constructed Hamiltonian with the same canonical
+        compiled representation. The exact construction object is intentionally
+        not re-read or recompiled. ``warn_if_hamiltonian_argument_differs`` is a
+        retained compatibility keyword; mismatches always raise ``ValueError``.
         """
         if self.num_threads is not None:
             nb.set_num_threads(self.num_threads)
 
-        if self.warn_if_hamiltonian_argument_differs and hamiltonian is not self.hamiltonian:
-            warnings.warn(
-                "ProjectedPauliCSRPRIMMEDiagonalizer uses the Hamiltonian compiled at construction time; "
-                "the hamiltonian argument was ignored.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        if hamiltonian is not self.hamiltonian:
+            if isinstance(hamiltonian, CompiledPauliHamiltonian):
+                call_compiled = _validate_compiled_pauli_hamiltonian(hamiltonian)
+            else:
+                call_compiled = compile_pauli_hamiltonian(
+                    hamiltonian,
+                    num_qubits=self.compiled.num_qubits,
+                    coefficient_cutoff=self.compiled.coefficient_cutoff,
+                    pauli_label_convention=self.compiled.pauli_label_convention,
+                    require_real_pauli_coefficients=(
+                        self.require_real_pauli_coefficients
+                    ),
+                )
+            if not _compiled_pauli_hamiltonians_are_equal(
+                self.compiled,
+                call_compiled,
+            ):
+                raise ValueError(
+                    "The call-time Hamiltonian does not match the Hamiltonian "
+                    "compiled when ProjectedPauliCSRPRIMMEDiagonalizer was "
+                    "constructed."
+                )
 
         basis = _validate_basis(logical_basis, num_qubits=self.compiled.num_qubits, validate_bits=self.validate_basis_bits)
         D = int(basis.shape[0])
@@ -1098,7 +1565,11 @@ class ProjectedPauliCSRPRIMMEDiagonalizer:
             raise RuntimeError("PRIMME returned invalid eigenvectors.")
 
         energy = float(np.real(evals[0]))
+        if not math.isfinite(energy):
+            raise RuntimeError("PRIMME returned a non-finite eigenvalue.")
         coeffs = np.asarray(evecs[:, 0], dtype=np.complex128)
+        if not np.all(np.isfinite(coeffs)):
+            raise RuntimeError("PRIMME returned non-finite eigenvector coefficients.")
         norm = float(np.linalg.norm(coeffs))
         if norm <= 0.0 or not math.isfinite(norm):
             raise RuntimeError("PRIMME returned an eigenvector with invalid norm.")
@@ -1206,6 +1677,11 @@ class ProjectedPauliCSRPRIMMEDiagonalizer:
                 data,
             )
         fill_stop = time.perf_counter()
+        if not np.all(np.isfinite(data)):
+            raise ValueError(
+                "Projected Hamiltonian matrix elements must remain finite; "
+                "Pauli-term accumulation overflowed."
+            )
 
         csr = ProjectedCSR(
             indptr=indptr,
@@ -1344,6 +1820,7 @@ class ProjectedPauliCSRPRIMMEDiagonalizer:
         clone = object.__new__(type(self))
         clone.hamiltonian = self.hamiltonian
         clone.compiled = self.compiled
+        clone.require_real_pauli_coefficients = self.require_real_pauli_coefficients
         clone.max_logical_qubits = self.max_logical_qubits
         clone.logical_basis_bit_order = self.logical_basis_bit_order
         clone.matrix_element_cutoff = self.matrix_element_cutoff
@@ -1374,7 +1851,10 @@ class ProjectedPauliCSRPRIMMEDiagonalizer:
     def _single_state_energy_from_csr(csr: ProjectedCSR) -> float:
         if csr.nnz == 0:
             return 0.0
-        return float(np.real(np.sum(csr.data)))
+        energy = float(np.real(np.sum(csr.data)))
+        if not math.isfinite(energy):
+            raise ValueError("Single-state projected energy must remain finite.")
+        return energy
 
     @staticmethod
     def _compute_residual(A: LinearOperator, energy: float, coeffs: np.ndarray) -> tuple[float, float]:
@@ -1388,6 +1868,8 @@ class ProjectedPauliCSRPRIMMEDiagonalizer:
             r = Av - float(energy) * vec
         residual_norm = float(np.linalg.norm(r))
         relative_residual = residual_norm / max(1.0, abs(float(energy)))
+        if not math.isfinite(residual_norm) or not math.isfinite(relative_residual):
+            raise RuntimeError("PRIMME residual calculation returned a non-finite value.")
         return residual_norm, relative_residual
 
     def build_projected_csr_for_debug(self, logical_basis: np.ndarray) -> tuple[ProjectedCSR, np.ndarray]:
@@ -1403,6 +1885,8 @@ class ProjectedPauliCSRPRIMMEDiagonalizer:
     def to_config(self) -> dict[str, Any]:
         return {
             "diagonalizer": "ProjectedPauliCSRPRIMMEDiagonalizer",
+            "package_version": PACKAGE_VERSION,
+            "algorithm_version": ALGORITHM_VERSION,
             "solver": "primme.eigsh",
             "num_qubits": self.compiled.num_qubits,
             "n_input_terms": self.compiled.n_input_terms,
@@ -1439,6 +1923,7 @@ def csr_to_dense_for_debug(csr: ProjectedCSR) -> np.ndarray:
 
 
 __all__ = [
+    "DEFAULT_MAX_LOGICAL_QUBITS",
     "PauliTerm",
     "CompiledPauliHamiltonian",
     "ProjectedCSR",

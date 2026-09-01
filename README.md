@@ -4,6 +4,32 @@ This package recovers pair-encoded measurement samples and diagonalizes the
 logical Hamiltonian in the recovered subspace for sample-based quantum
 diagonalization (SQD). It provides reusable methods associated with the paper.
 
+## Versions and reproducibility
+
+The Zenodo deposit accompanying the article is the **authoritative, immutable
+paper snapshot** ([DOI](https://doi.org/10.5281/zenodo.22015275)). Use that
+archive for exact reproduction of the reported results, including the archived
+source, notebooks, inputs, and result tables.
+
+The pre-maintenance GitHub package is preserved as the
+[`v1.0.0-paper-snapshot`](https://github.com/Byeongyong-Park/code-space-recovery-for-sqd/tree/v1.0.0-paper-snapshot)
+release tag. Its scientific and numerical implementation matches the archived
+source; the observed file-level differences are documentation/comments and
+non-computational diagnostic text. It is therefore computationally aligned
+with the paper code, although it is not a byte-for-byte archival copy. Use
+Zenodo when the exact deposited files, not only the calculation path, are
+required.
+
+The `v2.0.0` package and the current `main` branch are maintained,
+post-study software releases. They clarify the supported encoding convention,
+public API, provenance metadata, documentation, packaging, and tests. The
+scientific recovery algorithm remains `code_space_recovery_v1.0`.
+
+Some legacy result dictionaries retain `module_version="v1.0"` or an
+equivalent `core_version` field so existing artifact readers continue to work.
+Those are compatibility fields, not the installed distribution version. New
+provenance should use `package_version` together with `algorithm_version`.
+
 ## Features
 
 - 1D and 2D Ising benchmark Hamiltonians
@@ -16,10 +42,29 @@ diagonalization (SQD). It provides reusable methods associated with the paper.
 
 ## Installation
 
-Python 3.10 or later is required. From the repository root:
+Python 3.10 or later is required; CI tests Python 3.10 through 3.13. From the
+repository root:
 
 ```bash
 python -m pip install .
+```
+
+The projected diagonalizer depends on `primme`, which is distributed as source
+on PyPI. A local C/C++ build toolchain may therefore be required, especially on
+Windows. The repository CI performs the full installation and quick-start test
+on Ubuntu.
+
+IBM Quantum Runtime and M3 support are optional:
+
+```bash
+python -m pip install ".[hardware]"
+```
+
+For local tests:
+
+```bash
+python -m pip install ".[test]"
+python -m pytest -p no:cacheprovider
 ```
 
 ## Quick start
@@ -69,7 +114,32 @@ print(result.best_energy)
 print(len(result.best_logical_basis))
 ```
 
+For small projected subspaces, prefer `ncv=None` as shown above so PRIMME can
+choose a basis size compatible with the projected dimension. A fixed large
+`ncv` can be unsuitable for small toy problems.
+
 See [ALGORITHM.md](ALGORITHM.md) for the recovery procedure and stopping rules.
+
+## Public API
+
+Stable imports use the defining submodule rather than the package root:
+
+| Module | Public responsibility |
+| --- | --- |
+| `code_space_recovery.clustering` | weighted BMM clustering |
+| `code_space_recovery.encoding` | logical-to-pair-code Hamiltonian encoding |
+| `code_space_recovery.state_encoding` | pair-code state preparation |
+| `code_space_recovery.sqdrift` | logical SqDRIFT circuit generation |
+| `code_space_recovery.sampling` | sampling and mitigation utilities |
+| `code_space_recovery.recovery` | iterative code-space recovery |
+| `code_space_recovery.diagonalization` | projected sparse diagonalization |
+| `code_space_recovery.energy_variance` | full-Hamiltonian energy and variance |
+| `code_space_recovery.hamiltonians` | benchmark Hamiltonian builders |
+
+Each module's `__all__` defines its supported public names. Underscore-prefixed
+helpers are internal implementation details. Existing submodule import paths
+are retained in `v2.0.0`; see [MIGRATION.md](MIGRATION.md) for the one removed
+encoding mode.
 
 ## Input conventions
 
@@ -86,6 +156,23 @@ Duplicate raw outcomes must be merged before clustering. Weights may be raw
 counts or global weights; the recovery driver normalizes them once over the
 complete sample pool.
 
+Public data-loading and recovery helpers validate binary arrays before
+converting them to `np.uint8`. Malformed bits, non-finite values, invalid
+cluster labels, and incompatible precompiled-Hamiltonian settings raise an
+exception before numerical or hardware work begins.
+
+Hamiltonian iterators that can be consumed only once require an explicit
+`num_qubits`. Pauli Hamiltonians must be Hermitian, and callers should merge
+duplicate Pauli terms before applying a coefficient cutoff. Recovery schedules
+reject unknown keys. Saved sampling runs also reject mismatched job IDs,
+measurement mappings, backend provenance, incomplete managed branch outputs,
+and realization probability arrays whose sum is not approximately one.
+Checkpoint savers require a new or empty run directory. The submission saver
+also accepts the common calibration-first layout in which that directory
+contains exactly its own regular M3 calibration file and nothing else; all
+other pre-existing entries, reserved filenames, symlinks, and incomplete
+checkpoint markers are rejected before artifact writes begin.
+
 The pair code is
 
 ```text
@@ -97,10 +184,19 @@ Pairs `00` and `11` are invalid. Arrays follow Qiskit's displayed-bit order,
 where the rightmost logical bit corresponds to qubit 0, and the two rails for
 each logical bit remain adjacent.
 
+For logical qubit `q`, the first displayed rail is physical qubit `2q + 1` and
+the second is physical qubit `2q`. Hamiltonian encoding supports the single
+explicit mode `qiskit_label`, with displayed-pair map
+`I -> II`, `X -> XX`, `Y -> YX`, and `Z -> ZI`. The former
+`qiskit_qubit_index` mode is not supported in `v2.0.0` because it reverses the
+rail placement of asymmetric Pauli pairs.
+
 ## Reproducibility
 
 Batch execution supports `threading` and optional `loky` backends. Record the
-seed, backend, dimensions, and numerical settings for reproducibility.
+package version, algorithm version, seed, backend, dimensions, and numerical
+settings for reproducibility. Different dependency versions, numerical
+libraries, and hardware can still introduce floating-point differences.
 
 ## Citation
 

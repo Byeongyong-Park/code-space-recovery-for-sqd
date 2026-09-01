@@ -62,6 +62,11 @@ import numbers
 
 import numpy as np
 
+try:  # package import
+    from ._version import ALGORITHM_VERSION, PACKAGE_VERSION
+except ImportError:  # pragma: no cover - flat-module compatibility
+    from _version import ALGORITHM_VERSION, PACKAGE_VERSION  # type: ignore
+
 try:  # Keep the module importable even in environments without Qiskit.
     from qiskit.quantum_info import SparsePauliOp  # type: ignore
 except Exception as _exc:  # pragma: no cover - depends on user environment
@@ -72,7 +77,9 @@ else:  # pragma: no cover - trivial
 
 
 MODULE_VERSION = "v1.0"
-__version__ = MODULE_VERSION
+# Conventional module version follows the distribution; MODULE_VERSION remains
+# the legacy algorithm/output-schema identifier.
+__version__ = PACKAGE_VERSION
 QISKIT_QUBIT_INDEX_CONVENTION = (
     "Qiskit SparsePauliOp displayed labels are big-endian: the rightmost "
     "Pauli-label character acts on qubit 0. Logical basis rows in code-space "
@@ -118,6 +125,8 @@ class HamiltonianMetadata:
     module_version: str = MODULE_VERSION
     terms_preview: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    package_version: str = PACKAGE_VERSION
+    algorithm_version: str = ALGORITHM_VERSION
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonify(asdict(self))
@@ -296,8 +305,10 @@ def expand_coefficients(value: float | Sequence[float] | np.ndarray, length: int
     if arr.shape[0] != length:
         raise ValueError(f"{name} has length {arr.shape[0]}, expected {length}.")
     if np.iscomplexobj(arr):
-        imag = np.max(np.abs(np.imag(arr))) if arr.size else 0.0
-        if imag > 0.0:
+        imaginary_parts = np.imag(arr)
+        if not np.all(np.isfinite(imaginary_parts)):
+            raise ValueError(f"{name} must contain only finite values.")
+        if np.any(imaginary_parts != 0.0):
             raise ValueError(f"{name} must be real; got nonzero imaginary component.")
         arr = np.real(arr)
     out = arr.astype(np.float64, copy=True)
@@ -941,6 +952,8 @@ def summarize_sparse_pauliop(hamiltonian: Any, *, max_terms: int = 12) -> dict[s
             )
 
     return {
+        "package_version": PACKAGE_VERSION,
+        "algorithm_version": ALGORITHM_VERSION,
         "num_qubits": int(hamiltonian.num_qubits),
         "num_terms": int(len(labels)),
         "term_counts_by_kind": counts,

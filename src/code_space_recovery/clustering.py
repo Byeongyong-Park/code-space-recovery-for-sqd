@@ -43,6 +43,11 @@ from typing import Any
 
 import numpy as np
 
+try:  # package import
+    from ._version import PACKAGE_VERSION
+except ImportError:  # pragma: no cover - flat-module compatibility
+    from _version import PACKAGE_VERSION  # type: ignore
+
 try:  # Optional at import time; required when assign_clusters_bmm is called.
     from stepmix.stepmix import StepMix  # type: ignore
 except Exception:  # pragma: no cover - environment-dependent dependency
@@ -56,8 +61,9 @@ except Exception:  # pragma: no cover - environment-dependent dependency
 
 
 MODULE_VERSION = "v1.0"
-__version__ = MODULE_VERSION
-__clustering_name__ = "clustering_v1"
+# Conventional module version follows the distribution; MODULE_VERSION remains
+# the legacy algorithm/output-schema identifier.
+__version__ = PACKAGE_VERSION
 
 ClusteredSamples = tuple[tuple[np.ndarray, np.ndarray], ...]
 
@@ -131,8 +137,10 @@ def _validate_bmm_inputs(
         raise ValueError("probabilities must be finite.")
     if np.any(probs < 0.0):
         raise ValueError("probabilities must be nonnegative.")
-    if float(np.sum(probs)) <= 0.0:
-        raise ValueError("sum(probabilities) must be positive.")
+    with np.errstate(over="ignore", invalid="ignore"):
+        probability_total = float(np.sum(probs, dtype=np.float64))
+    if not np.isfinite(probability_total) or probability_total <= 0.0:
+        raise ValueError("sum(probabilities) must be finite and positive.")
 
     if isinstance(k, bool) or not isinstance(k, numbers.Integral):
         raise TypeError("k must be an integer.")
@@ -328,7 +336,9 @@ def assign_clusters_bmm(
     # StepMix's likelihood is invariant to a global sample-weight scale.
     # Normalize for numerical stability, but preserve the original probs scale
     # in the returned clustered weights.
-    fit_weights = probs / float(np.sum(probs))
+    # The total was checked for finiteness by `_validate_bmm_inputs`.
+    probability_total = float(np.sum(probs, dtype=np.float64))
+    fit_weights = probs / probability_total
 
     def fit_single_stepmix(seed: int) -> tuple[Any | None, float, str | None]:
         """Fit one StepMix model with exactly one EM initialization."""
@@ -372,12 +382,20 @@ def assign_clusters_bmm(
 
     best_model, _best_lower_bound = max(successful, key=lambda item: item[1])
 
-    labels = np.asarray(best_model.predict(bits), dtype=np.int64)
-
-    if labels.shape != (n_unique,):
+    raw_labels = np.asarray(best_model.predict(bits))
+    if raw_labels.ndim != 1 or raw_labels.shape != (n_unique,):
         raise RuntimeError(
-            f"StepMix returned labels with shape {labels.shape}, expected {(n_unique,)}."
+            f"StepMix returned labels with shape {raw_labels.shape}, expected {(n_unique,)}."
         )
+    if np.issubdtype(raw_labels.dtype, np.bool_) or not np.issubdtype(
+        raw_labels.dtype,
+        np.integer,
+    ):
+        raise RuntimeError(
+            f"StepMix returned non-integer labels with dtype {raw_labels.dtype}."
+        )
+    labels = raw_labels.astype(np.int64, copy=False)
+
     if np.any((labels < 0) | (labels >= k)):
         raise RuntimeError("StepMix returned labels outside [0, k).")
 

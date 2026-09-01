@@ -94,9 +94,26 @@ Z -> ZI
 ```
 
 `encode_sparse_pauliop` applies this map term by term without changing
-coefficients. Its default `qiskit_label` mode expands a displayed label from
-left to right. Optional simplification combines duplicate labels and removes
-small terms.
+coefficients. The single supported `qiskit_label` mode expands a displayed
+label from left to right. Optional simplification combines duplicate labels
+and removes small terms.
+
+For the one-qubit pair isometry `V`, the encoded operators obey
+`A_encoded V = V A` on the code space:
+
+| Logical operator | Encoded operator |
+| --- | --- |
+| `I` | `II` |
+| `X` | `XX` |
+| `Y` | `YX` |
+| `Z` | `ZI` |
+
+This table uses the displayed pair `[first rail, second rail]`, whose physical
+indices are `[2q + 1, 2q]`. The former `qiskit_qubit_index` placement is not an
+alternative convention: for the asymmetric `Y` and `Z` images it swaps the
+rails and changes their action on the code space. Version 2 supports only the
+displayed-label convention so the Hamiltonian encoder, state encoder, sampled
+bitstrings, and recovery decoder share one invariant.
 
 ### 3.2 State encoding
 
@@ -244,6 +261,9 @@ Fixed stages run a prescribed number of iterations. Adaptive stages stop after
 `convergence_patience` consecutive iterations, or when `max_iterations` is
 reached. The global best, references, and carry-over states persist across
 stages, while the patience counter resets at each stage boundary.
+Schedule entries accept only the documented `recovery_fn`, `name`, `iterations`,
+`min_iterations`, `max_iterations`, and `convergence_patience` keys; unknown
+keys are rejected before a stage callback runs.
 
 ## 6. Projected logical diagonalization
 
@@ -263,6 +283,12 @@ projected subspace; it is not the full-Hamiltonian variance.
 The diagonalizer compiles the Hamiltonian given at construction. It should be
 constructed from the same original logical Hamiltonian passed to the recovery
 driver.
+
+The compiled operator must be Hermitian in the canonical Pauli basis. A
+one-shot Hamiltonian iterator requires an explicit `num_qubits`. Duplicate
+Pauli terms should be merged before applying a coefficient cutoff; an input is
+rejected when merge-before-cutoff and cutoff-before-merge would otherwise make
+the diagonalization/variance and SqDRIFT paths use different operators.
 
 ## 7. Full-Hamiltonian energy and variance
 

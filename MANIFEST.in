@@ -1,0 +1,6 @@
+include ALGORITHM.md
+include CHANGELOG.md
+include CITATION.cff
+include LICENSE
+include MIGRATION.md
+include README.md

@@ -17,6 +17,11 @@ from qiskit import QuantumCircuit
 from qiskit.circuit.library import PauliEvolutionGate
 from qiskit.quantum_info import SparsePauliOp
 
+try:  # package import
+    from ._version import ALGORITHM_VERSION, PACKAGE_VERSION
+except ImportError:  # pragma: no cover - flat-module compatibility
+    from _version import ALGORITHM_VERSION, PACKAGE_VERSION  # type: ignore
+
 
 def _validate_positive_int(name: str, value: Any) -> int:
     """Validate that value is an integer >= 1."""
@@ -63,6 +68,12 @@ def _pair_seed(seed: int, k: int, r: int) -> int:
     return int.from_bytes(digest, byteorder="little", signed=False)
 
 
+def _require_finite_real(value: float, *, context: str) -> None:
+    """Reject NaN and infinite values before qDRIFT normalization or sampling."""
+    if not math.isfinite(float(value)):
+        raise ValueError(f"{context} must be finite, got {value!r}.")
+
+
 def _preprocess_sparse_pauli_hamiltonian(
     hamiltonian: SparsePauliOp,
     *,
@@ -90,6 +101,8 @@ def _preprocess_sparse_pauli_hamiltonian(
         preprocessed_hamiltonian is the signed effective Hamiltonian H_eff.
         It is not the positive-coefficient qDRIFT decomposition.
     """
+    if not isinstance(sort_terms, bool):
+        raise TypeError(f"sort_terms must be bool, got {type(sort_terms).__name__}.")
     if not isinstance(hamiltonian, SparsePauliOp):
         raise TypeError(
             "hamiltonian must be a qiskit.quantum_info.SparsePauliOp object."
@@ -104,23 +117,72 @@ def _preprocess_sparse_pauli_hamiltonian(
     coeffs = np.asarray(hamiltonian.coeffs, dtype=complex)
 
     merged_coeffs: dict[str, float] = {}
+    individually_retained_coeffs: dict[str, float] = {}
+    has_individually_dropped_coeff: dict[str, bool] = {}
     source_indices: dict[str, list[int]] = {}
 
     for original_index, (label, coeff) in enumerate(zip(labels, coeffs)):
-        if abs(float(np.imag(coeff))) > coefficient_atol:
+        real_part = float(np.real(coeff))
+        imaginary_part = float(np.imag(coeff))
+        if not (math.isfinite(real_part) and math.isfinite(imaginary_part)):
+            raise ValueError(
+                "Hamiltonian coefficients must be finite. "
+                f"Term index {original_index}, label {label}, coefficient {coeff}."
+            )
+        if abs(imaginary_part) > coefficient_atol:
             raise ValueError(
                 "Hamiltonian coefficients must be real for a Hermitian Pauli Hamiltonian. "
                 f"Term index {original_index}, label {label}, coefficient {coeff} has "
                 f"imaginary part larger than coefficient_atol={coefficient_atol}."
             )
 
-        real_coeff = float(np.real(coeff))
-        merged_coeffs[label] = merged_coeffs.get(label, 0.0) + real_coeff
+        merged_coeff = merged_coeffs.get(label, 0.0) + real_part
+        _require_finite_real(
+            merged_coeff,
+            context=f"Merged Hamiltonian coefficient for label {label!r}",
+        )
+        merged_coeffs[label] = merged_coeff
+        retained_coeff = individually_retained_coeffs.get(label, 0.0)
+        if abs(real_part) > coefficient_atol:
+            retained_coeff += real_part
+            _require_finite_real(
+                retained_coeff,
+                context=(
+                    "Individually retained Hamiltonian coefficient for label "
+                    f"{label!r}"
+                ),
+            )
+            individually_retained_coeffs[label] = retained_coeff
+        else:
+            has_individually_dropped_coeff[label] = True
         source_indices.setdefault(label, []).append(original_index)
+
+    for label, source_term_indices in source_indices.items():
+        if len(source_term_indices) < 2 or not has_individually_dropped_coeff.get(
+            label,
+            False,
+        ):
+            continue
+        retained_sum = individually_retained_coeffs.get(label, 0.0)
+        retained_final = (
+            retained_sum if abs(retained_sum) > coefficient_atol else 0.0
+        )
+        merged_sum = merged_coeffs[label]
+        merged_final = merged_sum if abs(merged_sum) > coefficient_atol else 0.0
+        if retained_final != merged_final:
+            raise ValueError(
+                "Duplicate Pauli terms are ambiguous at the coefficient cutoff: "
+                f"label {label!r} would have coefficient {retained_final!r} "
+                "when individual terms are dropped before merging, but "
+                f"coefficient {merged_final!r} when duplicates are merged first. "
+                "Merge duplicate terms explicitly before using diagonalization, "
+                "variance, or SqDRIFT."
+            )
 
     num_unique_labels_after_merge = len(merged_coeffs)
 
     identity_shift = float(merged_coeffs.pop(identity_label, 0.0))
+    _require_finite_real(identity_shift, context="Merged identity coefficient")
     identity_source_indices = source_indices.get(identity_label, [])
 
     if abs(identity_shift) <= coefficient_atol:
@@ -131,6 +193,10 @@ def _preprocess_sparse_pauli_hamiltonian(
 
     for label, coeff in merged_coeffs.items():
         coeff = float(coeff)
+        _require_finite_real(
+            coeff,
+            context=f"Merged Hamiltonian coefficient for label {label!r}",
+        )
         if abs(coeff) <= coefficient_atol:
             dropped_zero_labels.append(label)
         else:
@@ -150,8 +216,31 @@ def _preprocess_sparse_pauli_hamiltonian(
         )
         signs = np.sign(signed_coefficients).astype(float)
         weights = np.abs(signed_coefficients).astype(float)
-        lambda_value = float(np.sum(weights))
+        if not np.all(np.isfinite(weights)):
+            raise ValueError("qDRIFT term weights must all be finite.")
+        with np.errstate(over="ignore", invalid="ignore"):
+            lambda_value = float(np.sum(weights))
+        if not math.isfinite(lambda_value) or lambda_value <= 0.0:
+            raise ValueError(
+                "qDRIFT lambda must be finite and > 0 after merging non-identity "
+                f"terms, got {lambda_value}."
+            )
         probabilities = weights / lambda_value
+        if not np.all(np.isfinite(probabilities)):
+            raise ValueError("qDRIFT probabilities must all be finite.")
+        if np.any((probabilities < 0.0) | (probabilities > 1.0)):
+            raise ValueError("qDRIFT probabilities must all lie in [0, 1].")
+        probability_sum = float(np.sum(probabilities))
+        if not math.isfinite(probability_sum) or not math.isclose(
+            probability_sum,
+            1.0,
+            rel_tol=1e-12,
+            abs_tol=1e-15,
+        ):
+            raise ValueError(
+                "qDRIFT probabilities must have a finite sum equal to 1, "
+                f"got {probability_sum}."
+            )
     else:
         # Zero effective Hamiltonian. Qiskit still needs a valid SparsePauliOp object.
         preprocessed_hamiltonian = SparsePauliOp.from_list([(identity_label, 0.0)])
@@ -347,6 +436,8 @@ def generate_sqdrift_logical_circuits(
         raise TypeError(
             f"include_k0 must be bool, got {type(include_k0).__name__}."
         )
+    if not isinstance(sort_terms, bool):
+        raise TypeError(f"sort_terms must be bool, got {type(sort_terms).__name__}.")
 
     K = _validate_positive_int("K", K)
     N_R = _validate_positive_int("N_R", N_R)
@@ -401,9 +492,18 @@ def generate_sqdrift_logical_circuits(
     # k >= 1 randomized qDRIFT circuits.
     for k in range(1, K):
         tau_k = float(k * delta_t)
+        if not math.isfinite(tau_k):
+            raise ValueError(
+                f"SqDRIFT evolution time k * delta_t must remain finite, got {tau_k}."
+            )
         qdrift_base_step_time = (
             float(lambda_value * tau_k / N_seq) if lambda_value > 0.0 else 0.0
         )
+        if not math.isfinite(qdrift_base_step_time):
+            raise ValueError(
+                "SqDRIFT base step time must remain finite; lambda * evolution "
+                "time overflowed."
+            )
 
         for r in range(N_R):
             record_id = f"sqdrift_k{k:03d}_r{r:03d}"
@@ -429,6 +529,8 @@ def generate_sqdrift_logical_circuits(
             for term_index in sampled_term_indices:
                 pauli_label = processed_labels[term_index]
                 signed_time = float(signs[term_index] * qdrift_base_step_time)
+                if not math.isfinite(signed_time):
+                    raise ValueError("SqDRIFT signed Pauli evolution time must be finite.")
 
                 gate = _make_single_pauli_evolution_gate(
                     pauli_label=pauli_label,
@@ -455,6 +557,8 @@ def generate_sqdrift_logical_circuits(
 
     result = {
         "metadata": {
+            "package_version": PACKAGE_VERSION,
+            "algorithm_version": ALGORITHM_VERSION,
             "hamiltonian": hamiltonian.copy(),
             "preprocessed_hamiltonian": preprocessing["preprocessed_hamiltonian"],
             "identity_shift": preprocessing["identity_shift"],
@@ -499,3 +603,8 @@ def generate_sqdrift_logical_circuits(
         )
 
     return result
+
+
+__all__ = [
+    "generate_sqdrift_logical_circuits",
+]

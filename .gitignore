@@ -7,6 +7,11 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+/.codex_validation_tmp/
+/.testdeps/
+/.t/
+/.n/
+/.server_known_hosts
 .coverage
 coverage.xml
 htmlcov/

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "code-space-recovery-for-sqd"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Code-space recovery for sample-based quantum diagonalization"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,10 +31,17 @@ hardware = [
     "qiskit-ibm-runtime",
     "mthree",
 ]
+test = [
+    "pytest",
+]
 
 [project.urls]
 Repository = "https://github.com/Byeongyong-Park/code-space-recovery-for-sqd"
 Paper = "https://arxiv.org/abs/2607.10227"
+Changelog = "https://github.com/Byeongyong-Park/code-space-recovery-for-sqd/blob/main/CHANGELOG.md"
+
+[tool.setuptools.dynamic]
+version = { attr = "code_space_recovery._version.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

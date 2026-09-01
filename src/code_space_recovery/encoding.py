@@ -6,37 +6,50 @@ Logical-to-pair code:
     |0>_L -> |01>
     |1>_L -> |10>
 
-Pauli representation on the code space, written in pair order:
+Pauli representation on the code space, written in displayed pair order
+``[first rail, second rail]``:
     I -> II
     X -> XX
     Y -> YX
     Z -> ZI
 
-The default `mode="qiskit_label"` is intended for Qiskit SparsePauliOp labels.
-Qiskit Pauli labels are displayed in descending qubit-index order. Therefore,
-for one logical qubit the label "Z" is encoded as the label "ZI", which means
-Z acts on the first character of the displayed two-bit pair. Equivalently, if
-the physical qubits are indexed (q0, q1), the code pair |01>, |10> is read in
-Qiskit's displayed bitstring order (q1 q0).
+Only ``mode="qiskit_label"`` is supported. Qiskit Pauli labels are displayed
+in descending qubit-index order, so each logical label character is expanded
+directly to one adjacent displayed pair. For logical qubit ``q``, the first
+displayed rail is physical qubit ``2q+1`` and the second is physical qubit
+``2q``. Thus logical ``Z`` becomes displayed label ``ZI`` and acts on the
+first rail, consistently with state preparation and recovery.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Literal, Mapping
 
 import numpy as np
 from qiskit.quantum_info import SparsePauliOp
 
-PauliEncodingMode = Literal["qiskit_label", "qiskit_qubit_index"]
+try:  # package import
+    from ._version import ALGORITHM_VERSION, PACKAGE_VERSION
+except ImportError:  # pragma: no cover - flat-module compatibility
+    from _version import ALGORITHM_VERSION, PACKAGE_VERSION  # type: ignore
+
+
+PauliEncodingMode = Literal["qiskit_label"]
 
 # Pair strings are written in pair tensor/display order: first rail, second rail.
-DEFAULT_PAIR_PAULI_MAP: dict[str, str] = {
+_CANONICAL_PAIR_PAULI_MAP: Mapping[str, str] = MappingProxyType({
     "I": "II",
     "X": "XX",
     "Y": "YX",
     "Z": "ZI",
-}
+})
+# Expose a separate read-only view so callers cannot mutate the package's
+# private canonical baseline through the public constant.
+DEFAULT_PAIR_PAULI_MAP: Mapping[str, str] = MappingProxyType(
+    dict(_CANONICAL_PAIR_PAULI_MAP)
+)
 
 
 @dataclass(frozen=True)
@@ -51,14 +64,21 @@ class EncodingMetadata:
     pair_pauli_map: dict[str, str]
     simplify: bool
     atol: float
+    package_version: str = PACKAGE_VERSION
+    algorithm_version: str = ALGORITHM_VERSION
 
 
 def _validate_mode(mode: str) -> PauliEncodingMode:
-    if mode not in {"qiskit_label", "qiskit_qubit_index"}:
+    if mode == "qiskit_qubit_index":
         raise ValueError(
-            "mode must be either 'qiskit_label' or 'qiskit_qubit_index', "
-            f"got {mode!r}."
+            "mode='qiskit_qubit_index' was removed in code-space-recovery 2.0 "
+            "because its physical-rail placement is incompatible with the package's "
+            "state-encoding and recovery convention. Use mode='qiskit_label'. "
+            "Use code-space-recovery 1.x only to read or reproduce a legacy "
+            "physical-qubit-index artifact."
         )
+    if mode != "qiskit_label":
+        raise ValueError(f"mode must be 'qiskit_label', got {mode!r}.")
     return mode  # type: ignore[return-value]
 
 
@@ -83,6 +103,13 @@ def _validate_pair_pauli_map(pair_pauli_map: Mapping[str, str]) -> dict[str, str
                 f"pair_pauli_map[{key!r}] contains a non-Pauli character: {value!r}."
             )
         out[str(key)] = str(value)
+    if out != _CANONICAL_PAIR_PAULI_MAP:
+        raise ValueError(
+            "custom pair_pauli_map values are not supported in "
+            "code-space-recovery 2.x because they can violate the package-wide "
+            "state-encoding and recovery rail convention. Use the canonical map "
+            "{'I': 'II', 'X': 'XX', 'Y': 'YX', 'Z': 'ZI'}."
+        )
     return out
 
 
@@ -99,17 +126,14 @@ def encode_pauli_label(
     label:
         Pauli label containing only I, X, Y, Z.
     mode:
-        - "qiskit_label": expand the displayed Qiskit label character by
-          character. This is the recommended default when the input and output
-          are both Qiskit SparsePauliOp objects and encoded bitstrings are read
-          in Qiskit's displayed order.
-        - "qiskit_qubit_index": interpret input labels using Qiskit's qubit
-          indexing convention and map logical qubit q to physical qubits
-          (2q, 2q+1). In this mode, the first character of the pair map acts on
-          physical qubit 2q and the second on physical qubit 2q+1.
+        Must be ``"qiskit_label"``. The displayed Qiskit label is expanded
+        character by character. The first character of each pair map acts on
+        physical qubit ``2q+1`` and the second on physical qubit ``2q``.
+        The legacy ``"qiskit_qubit_index"`` mode was removed in version 2.0.
     pair_pauli_map:
-        Mapping for logical single-qubit Paulis. Defaults to
-        I->II, X->XX, Y->YX, Z->ZI.
+        Optional explicit copy of the canonical mapping
+        I->II, X->XX, Y->YX, Z->ZI. Other mappings are rejected because they
+        are incompatible with the package-wide rail convention.
 
     Returns
     -------
@@ -117,7 +141,9 @@ def encode_pauli_label(
         Encoded 2n-qubit Pauli label.
     """
     mode = _validate_mode(mode)
-    pair_map = _validate_pair_pauli_map(pair_pauli_map or DEFAULT_PAIR_PAULI_MAP)
+    pair_map = _validate_pair_pauli_map(
+        _CANONICAL_PAIR_PAULI_MAP if pair_pauli_map is None else pair_pauli_map
+    )
 
     if not isinstance(label, str):
         raise TypeError(f"label must be a string, got {type(label).__name__}.")
@@ -126,26 +152,7 @@ def encode_pauli_label(
     if any(ch not in {"I", "X", "Y", "Z"} for ch in label):
         raise ValueError(f"label contains a non-Pauli character: {label!r}.")
 
-    if mode == "qiskit_label":
-        return "".join(pair_map[ch] for ch in label)
-
-    # Qiskit label position pos acts on qubit q = n - 1 - pos.
-    # We explicitly place the encoded pair on physical qubits (2q, 2q+1).
-    n_logical = len(label)
-    n_physical = 2 * n_logical
-    encoded_chars = ["I"] * n_physical
-
-    for pos, ch in enumerate(label):
-        logical_q = n_logical - 1 - pos
-        pair = pair_map[ch]
-
-        physical_q0 = 2 * logical_q
-        physical_q1 = 2 * logical_q + 1
-
-        encoded_chars[n_physical - 1 - physical_q0] = pair[0]
-        encoded_chars[n_physical - 1 - physical_q1] = pair[1]
-
-    return "".join(encoded_chars)
+    return "".join(pair_map[ch] for ch in label)
 
 
 def encode_sparse_pauliop(
@@ -166,7 +173,9 @@ def encode_sparse_pauliop(
             "hamiltonian must be a qiskit.quantum_info.SparsePauliOp object."
         )
     mode = _validate_mode(mode)
-    pair_map = _validate_pair_pauli_map(pair_pauli_map or DEFAULT_PAIR_PAULI_MAP)
+    pair_map = _validate_pair_pauli_map(
+        _CANONICAL_PAIR_PAULI_MAP if pair_pauli_map is None else pair_pauli_map
+    )
     if not isinstance(simplify, bool):
         raise TypeError(f"simplify must be bool, got {type(simplify).__name__}.")
     atol = float(atol)
@@ -175,6 +184,8 @@ def encode_sparse_pauliop(
 
     input_labels = list(hamiltonian.paulis.to_labels())
     coeffs = np.asarray(hamiltonian.coeffs, dtype=complex)
+    if not np.all(np.isfinite(coeffs)):
+        raise ValueError("hamiltonian coefficients must be finite.")
     n_logical = int(hamiltonian.num_qubits)
 
     if len(input_labels) == 0:
@@ -208,7 +219,9 @@ def encode_sparse_pauliop_with_metadata(
 ) -> tuple[SparsePauliOp, EncodingMetadata]:
     """Same as `encode_sparse_pauliop`, but also return metadata.
     """
-    pair_map = _validate_pair_pauli_map(pair_pauli_map or DEFAULT_PAIR_PAULI_MAP)
+    pair_map = _validate_pair_pauli_map(
+        _CANONICAL_PAIR_PAULI_MAP if pair_pauli_map is None else pair_pauli_map
+    )
     encoded = encode_sparse_pauliop(
         hamiltonian,
         mode=mode,
@@ -235,15 +248,26 @@ def summarize_encoding(
     *,
     mode: PauliEncodingMode,
 ) -> dict[str, Any]:
-    """Summarize an encoding that uses ``DEFAULT_PAIR_PAULI_MAP``.
-
-    Use ``encode_sparse_pauliop_with_metadata`` to record a custom pair map.
-    """
+    """Summarize an encoding that uses the canonical pair Pauli map."""
+    mode = _validate_mode(mode)
     return {
         "input_num_qubits": int(hamiltonian.num_qubits),
         "output_num_qubits": int(encoded_hamiltonian.num_qubits),
         "input_num_terms": int(len(hamiltonian)),
         "output_num_terms": int(len(encoded_hamiltonian)),
         "mode": mode,
-        "pair_pauli_map": dict(DEFAULT_PAIR_PAULI_MAP),
+        "pair_pauli_map": dict(_CANONICAL_PAIR_PAULI_MAP),
+        "package_version": PACKAGE_VERSION,
+        "algorithm_version": ALGORITHM_VERSION,
     }
+
+
+__all__ = [
+    "PauliEncodingMode",
+    "DEFAULT_PAIR_PAULI_MAP",
+    "EncodingMetadata",
+    "encode_pauli_label",
+    "encode_sparse_pauliop",
+    "encode_sparse_pauliop_with_metadata",
+    "summarize_encoding",
+]

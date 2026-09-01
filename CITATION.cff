@@ -1,8 +1,8 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite the article in preferred-citation."
+message: "If you use this software, please cite the article in preferred-citation. Use the accompanying Zenodo deposit for the authoritative paper snapshot."
 title: "Code-space recovery for SQD"
 type: software
-version: "1.0.0"
+version: "2.0.0"
 license: MIT
 repository-code: "https://github.com/Byeongyong-Park/code-space-recovery-for-sqd"
 authors:

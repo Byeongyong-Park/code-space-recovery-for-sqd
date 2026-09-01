@@ -10,6 +10,11 @@ from typing import Any
 
 from qiskit import QuantumCircuit
 
+try:  # package import
+    from ._version import ALGORITHM_VERSION, PACKAGE_VERSION
+except ImportError:  # pragma: no cover - flat-module compatibility
+    from _version import ALGORITHM_VERSION, PACKAGE_VERSION  # type: ignore
+
 
 @dataclass(frozen=True)
 class PairEncodedStateCircuitMetadata:
@@ -22,6 +27,8 @@ class PairEncodedStateCircuitMetadata:
     logical_to_encoded_qubits: dict[int, tuple[int, int]]
     pair_code: str
     qiskit_order_note: str
+    package_version: str = PACKAGE_VERSION
+    algorithm_version: str = ALGORITHM_VERSION
 
 
 def pair_code_rail_qubits(n_logical: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -180,9 +187,18 @@ def encode_state_preparation_circuit_pair_code(
             "second_rail_qubits": metadata.second_rail_qubits,
             "logical_to_encoded_qubits": metadata.logical_to_encoded_qubits,
             "qiskit_order_note": metadata.qiskit_order_note,
+            "package_version": metadata.package_version,
+            "algorithm_version": metadata.algorithm_version,
         }
     )
 
     if return_metadata:
         return encoded, metadata
     return encoded
+
+
+__all__ = [
+    "PairEncodedStateCircuitMetadata",
+    "pair_code_rail_qubits",
+    "encode_state_preparation_circuit_pair_code",
+]

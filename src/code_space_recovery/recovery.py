@@ -27,11 +27,17 @@ import time
 import numba as nb
 import numpy as np
 
+try:  # package import
+    from ._version import ALGORITHM_VERSION, PACKAGE_VERSION
+except ImportError:  # pragma: no cover - flat-module compatibility
+    from _version import ALGORITHM_VERSION, PACKAGE_VERSION  # type: ignore
+
 
 MODULE_VERSION = "v1.0"
-ALGORITHM_VERSION = "code_space_recovery_v1.0"
-__version__ = MODULE_VERSION
-__core_name__ = "code_space_recovery_core_v1_0"
+# Conventional module version follows the distribution; MODULE_VERSION remains
+# the legacy core/output-schema identifier.
+__version__ = PACKAGE_VERSION
+_CORE_NAME = "code_space_recovery_core_v1_0"
 
 
 # =============================================================================
@@ -139,6 +145,138 @@ class SparseInvalidPairs:
 # =============================================================================
 
 
+def _as_exact_binary_uint8(
+    name: str,
+    value: Any,
+    *,
+    ndim: int = 2,
+) -> np.ndarray:
+    """Validate exact binary values before converting them to ``uint8``.
+
+    Checking the original array is essential: converting first would silently
+    truncate fractional values and wrap large integers modulo 256. Numeric
+    dtypes (including Boolean and complex values with zero imaginary part) are
+    accepted when every element is finite and exactly equal to zero or one.
+    """
+    array = np.asarray(value)
+    if array.ndim != ndim:
+        raise ValueError(f"{name} must be a {ndim}D array. Got shape {array.shape}.")
+    if not (
+        np.issubdtype(array.dtype, np.number)
+        or np.issubdtype(array.dtype, np.bool_)
+    ):
+        raise TypeError(
+            f"{name} must have a numeric binary dtype. Got {array.dtype}."
+        )
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must contain only finite values.")
+    if not np.all((array == 0) | (array == 1)):
+        raise ValueError(f"{name} must contain exactly 0 or 1.")
+
+    # A complex value can pass the exact comparison only when its imaginary
+    # part is zero. Taking the real component avoids ComplexWarning on cast.
+    if np.issubdtype(array.dtype, np.complexfloating):
+        array = array.real
+    return np.asarray(array, dtype=np.uint8)
+
+
+def _as_finite_real_array(
+    name: str,
+    value: Any,
+    *,
+    ndim: int | None = None,
+) -> np.ndarray:
+    """Return a finite real ``float64`` array without coercing bad dtypes."""
+    array = np.asarray(value)
+    if ndim is not None and array.ndim != ndim:
+        raise ValueError(f"{name} must be a {ndim}D array. Got shape {array.shape}.")
+    if not np.issubdtype(array.dtype, np.number) or np.issubdtype(
+        array.dtype,
+        np.complexfloating,
+    ):
+        raise TypeError(f"{name} must have a real numeric dtype. Got {array.dtype}.")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must contain only finite values.")
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        out = np.asarray(array, dtype=np.float64)
+    if not np.all(np.isfinite(out)):
+        raise ValueError(f"{name} cannot be represented as finite float64 values.")
+    return out
+
+
+def _as_finite_nonnegative_weights(
+    name: str,
+    value: Any,
+) -> np.ndarray:
+    """Validate a one-dimensional finite nonnegative weight array."""
+    weights = _as_finite_real_array(name, value, ndim=1)
+    if np.any(weights < 0.0):
+        raise ValueError(f"{name} must be nonnegative.")
+    return weights
+
+
+def _as_reference_vectors(
+    name: str,
+    value: Any,
+    *,
+    require_normalized: bool,
+) -> np.ndarray:
+    """Validate nonnegative pair-reference vectors.
+
+    Consumers require every pair to be a probability pair whose entries sum
+    to one. The normalizer accepts arbitrary finite nonnegative magnitudes and
+    maps a zero pair to the neutral reference ``[0.5, 0.5]``.
+    """
+    reference_vectors = _as_finite_real_array(name, value, ndim=2)
+    if reference_vectors.shape[1] % 2 != 0:
+        raise ValueError(f"{name} must have an even number of columns.")
+    if np.any(reference_vectors < 0.0):
+        raise ValueError(f"{name} must be nonnegative.")
+
+    pairs = reference_vectors.reshape(reference_vectors.shape[0], -1, 2)
+    pair_sums = pairs.sum(axis=2)
+    if not np.all(np.isfinite(pair_sums)):
+        raise ValueError(f"{name} pair sums must be finite.")
+    if require_normalized:
+        if np.any(reference_vectors > 1.0):
+            raise ValueError(f"{name} entries must be in [0, 1].")
+        if not np.all(np.isclose(pair_sums, 1.0, rtol=1e-12, atol=1e-12)):
+            raise ValueError(f"Each pair in {name} must sum to 1.")
+    return reference_vectors
+
+
+def _as_cluster_labels(
+    labels: Any,
+    *,
+    num_samples: int,
+    n_clusters: int,
+) -> np.ndarray:
+    """Validate cluster labels before using them for array indexing."""
+    labels_array = np.asarray(labels)
+    if labels_array.ndim != 1:
+        raise ValueError(
+            f"labels must be a 1D array. Got shape {labels_array.shape}."
+        )
+    if labels_array.shape[0] != num_samples:
+        raise ValueError(
+            "labels must have one entry per encoded sample. "
+            f"Got {labels_array.shape[0]} labels for {num_samples} samples."
+        )
+    if np.issubdtype(labels_array.dtype, np.bool_) or not np.issubdtype(
+        labels_array.dtype,
+        np.integer,
+    ):
+        raise TypeError(
+            f"labels must have an integer dtype. Got {labels_array.dtype}."
+        )
+    if np.any(labels_array < 0) or np.any(labels_array >= n_clusters):
+        raise ValueError(
+            f"labels must satisfy 0 <= label < {n_clusters}."
+        )
+    return labels_array.astype(np.int64, copy=False)
+
+
 def _validate_positive_int(name: str, value: Any) -> int:
     """Validate a positive integer."""
     if isinstance(value, bool) or not isinstance(value, numbers.Integral):
@@ -241,6 +379,18 @@ def _default_recovery_stage_name(
     return f"stage_{stage_index + 1}_{method}"
 
 
+_RECOVERY_SCHEDULE_STAGE_KEYS = frozenset(
+    {
+        "recovery_fn",
+        "name",
+        "iterations",
+        "min_iterations",
+        "max_iterations",
+        "convergence_patience",
+    }
+)
+
+
 def _normalize_recovery_schedule_entry(
     raw_stage: Mapping[str, Any],
     *,
@@ -249,6 +399,18 @@ def _normalize_recovery_schedule_entry(
     default_max_iterations: int,
     default_convergence_patience: int,
 ) -> _RecoveryScheduleStage:
+    unknown_keys = set(raw_stage).difference(_RECOVERY_SCHEDULE_STAGE_KEYS)
+    if unknown_keys:
+        rendered_unknown = ", ".join(
+            sorted((repr(key) for key in unknown_keys))
+        )
+        rendered_allowed = ", ".join(
+            repr(key) for key in sorted(_RECOVERY_SCHEDULE_STAGE_KEYS)
+        )
+        raise ValueError(
+            f"recovery_schedule[{stage_index}] contains unsupported key(s): "
+            f"{rendered_unknown}. Allowed keys are: {rendered_allowed}."
+        )
     if "recovery_fn" not in raw_stage:
         raise ValueError(
             f"recovery_schedule[{stage_index}] must contain a 'recovery_fn'."
@@ -494,11 +656,9 @@ def _merge_duplicate_rows_sum_weights(
     weights: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Merge duplicate bitstring rows and sum their weights."""
-    bitstrings = np.asarray(bitstrings, dtype=np.uint8)
-    weights = np.asarray(weights, dtype=np.float64)
+    bitstrings = _as_exact_binary_uint8("bitstrings", bitstrings)
+    weights = _as_finite_nonnegative_weights("weights", weights)
 
-    if bitstrings.ndim != 2:
-        raise ValueError("bitstrings must be a 2D array.")
     if weights.ndim != 1 or weights.shape[0] != bitstrings.shape[0]:
         raise ValueError("weights must be 1D and have the same length as bitstrings.")
 
@@ -515,7 +675,12 @@ def _merge_duplicate_rows_sum_weights(
     )
 
     unique_weights = np.zeros(len(first_indices), dtype=np.float64)
-    np.add.at(unique_weights, inverse, weights)
+    with np.errstate(over="ignore", invalid="ignore"):
+        np.add.at(unique_weights, inverse, weights)
+    if not np.all(np.isfinite(unique_weights)):
+        raise ValueError(
+            "merged weights must remain finite; duplicate-row accumulation overflowed."
+        )
     unique_bitstrings = bitstrings_c[first_indices]
 
     return unique_bitstrings.astype(np.uint8, copy=True), unique_weights
@@ -569,11 +734,7 @@ def encode_logical_to_valid_encoded(logical_basis: np.ndarray) -> np.ndarray:
     >>> encode_logical_to_valid_encoded(logical)
     array([[0, 1, 0, 1, 1, 0]], dtype=uint8)
     """
-    logical_basis = np.asarray(logical_basis, dtype=np.uint8)
-    if logical_basis.ndim != 2:
-        raise ValueError("logical_basis must be a 2D array.")
-    if not np.all((logical_basis == 0) | (logical_basis == 1)):
-        raise ValueError("logical_basis must contain only 0 or 1.")
+    logical_basis = _as_exact_binary_uint8("logical_basis", logical_basis)
 
     num_basis, n_logical = logical_basis.shape
     encoded = np.empty((num_basis, 2 * n_logical), dtype=np.uint8)
@@ -600,9 +761,10 @@ def is_valid_encoded_bitstrings(encoded_bitstrings: np.ndarray) -> np.ndarray:
         dtype = bool
         ``valid_mask[i]`` is true when row ``i`` is valid in every pair.
     """
-    encoded_bitstrings = np.asarray(encoded_bitstrings, dtype=np.uint8)
-    if encoded_bitstrings.ndim != 2:
-        raise ValueError("encoded_bitstrings must be a 2D array.")
+    encoded_bitstrings = _as_exact_binary_uint8(
+        "encoded_bitstrings",
+        encoded_bitstrings,
+    )
     if encoded_bitstrings.shape[1] % 2 != 0:
         raise ValueError("encoded_bitstrings must have even number of columns.")
 
@@ -645,11 +807,13 @@ def decode_valid_encoded_to_logical(
     -------
     encoded 01 01 10 -> logical 001
     """
-    valid_encoded_bitstrings = np.asarray(valid_encoded_bitstrings, dtype=np.uint8)
-    if valid_encoded_bitstrings.ndim != 2:
-        raise ValueError("valid_encoded_bitstrings must be a 2D array.")
+    valid_encoded_bitstrings = _as_exact_binary_uint8(
+        "valid_encoded_bitstrings",
+        valid_encoded_bitstrings,
+    )
     if valid_encoded_bitstrings.shape[1] % 2 != 0:
         raise ValueError("encoded bitstring length must be even.")
+    check_valid = _validate_bool("check_valid", check_valid)
     if check_valid and not np.all(is_valid_encoded_bitstrings(valid_encoded_bitstrings)):
         raise ValueError("All encoded bitstrings must be valid before decoding.")
 
@@ -692,7 +856,10 @@ def _validate_and_flatten_clustered_samples(
 
         encoded_bitstrings_k, weights_k = cluster
         encoded_bitstrings_k = np.asarray(encoded_bitstrings_k)
-        weights_k = np.asarray(weights_k, dtype=np.float64)
+        weights_k = _as_finite_nonnegative_weights(
+            f"weights for cluster {k}",
+            weights_k,
+        )
 
         if encoded_bitstrings_k.ndim != 2:
             raise ValueError(f"encoded_bitstrings for cluster {k} must be a 2D array.")
@@ -709,18 +876,11 @@ def _validate_and_flatten_clustered_samples(
         if not np.all((encoded_bitstrings_k == 0) | (encoded_bitstrings_k == 1)):
             raise ValueError(f"encoded_bitstrings for cluster {k} must contain only 0 or 1.")
 
-        if weights_k.ndim != 1:
-            raise ValueError(f"weights for cluster {k} must be a 1D array.")
         if weights_k.shape[0] != encoded_bitstrings_k.shape[0]:
             raise ValueError(
                 f"weights for cluster {k} must have length matching bitstrings. "
                 f"Got {weights_k.shape[0]} and {encoded_bitstrings_k.shape[0]}."
             )
-        if not np.all(np.isfinite(weights_k)):
-            raise ValueError(f"weights for cluster {k} must be finite.")
-        if np.any(weights_k < 0):
-            raise ValueError(f"weights for cluster {k} must be nonnegative.")
-
         cluster_weight = float(np.sum(weights_k))
         total_weight += cluster_weight
 
@@ -811,11 +971,11 @@ def _validate_deterministic_logical_basis(
 
 def pairwise_normalize_reference_vectors(reference_vectors: np.ndarray) -> np.ndarray:
     """Normalize each encoded pair in every cluster reference vector."""
-    reference_vectors = np.asarray(reference_vectors, dtype=np.float64)
-    if reference_vectors.ndim != 2:
-        raise ValueError("reference_vectors must be a 2D array.")
-    if reference_vectors.shape[1] % 2 != 0:
-        raise ValueError("reference_vectors must have even number of columns.")
+    reference_vectors = _as_reference_vectors(
+        "reference_vectors",
+        reference_vectors,
+        require_normalized=False,
+    )
 
     n_clusters, n_encoded = reference_vectors.shape
     n_logical = n_encoded // 2
@@ -842,11 +1002,40 @@ def initialize_reference_vectors(
     n_logical: int,
 ) -> np.ndarray:
     """Build initial cluster references from weighted encoded samples."""
+    n_logical = _validate_positive_int("n_logical", n_logical)
+    if isinstance(clustered_samples, (str, bytes)) or not isinstance(
+        clustered_samples,
+        Sequence,
+    ):
+        raise TypeError("clustered_samples must be a sequence of (bits, weights) pairs.")
+
     n_encoded = 2 * n_logical
     n_clusters = len(clustered_samples)
     refs = np.zeros((n_clusters, n_encoded), dtype=np.float64)
 
-    for k, (bits, weights) in enumerate(clustered_samples):
+    for k, cluster in enumerate(clustered_samples):
+        if not isinstance(cluster, (tuple, list)) or len(cluster) != 2:
+            raise TypeError(
+                f"clustered_samples[{k}] must be a (bits, weights) pair."
+            )
+        bits, weights = cluster
+        bits = _as_exact_binary_uint8(
+            f"clustered_samples[{k}].bitstrings",
+            bits,
+        )
+        weights = _as_finite_nonnegative_weights(
+            f"clustered_samples[{k}].weights",
+            weights,
+        )
+        if bits.shape[1] != n_encoded:
+            raise ValueError(
+                f"clustered_samples[{k}].bitstrings must have width {n_encoded}. "
+                f"Got {bits.shape[1]}."
+            )
+        if weights.shape[0] != bits.shape[0]:
+            raise ValueError(
+                f"clustered_samples[{k}].weights must match the number of rows."
+            )
         if len(bits) == 0 or float(np.sum(weights)) <= 0.0:
             # Empty clusters start from a neutral pair reference.
             refs[k, 0::2] = 0.5
@@ -903,11 +1092,17 @@ def assign_to_nearest_reference(
     ``(chunk_size, n_clusters)`` matrix. Exact ties select the lowest cluster
     index.
     """
-    encoded_bitstrings = np.asarray(encoded_bitstrings, dtype=np.uint8)
-    reference_vectors = np.asarray(reference_vectors, dtype=np.float64)
+    chunk_size = _validate_positive_int("chunk_size", chunk_size)
+    encoded_bitstrings = _as_exact_binary_uint8(
+        "encoded_bitstrings",
+        encoded_bitstrings,
+    )
+    reference_vectors = _as_reference_vectors(
+        "reference_vectors",
+        reference_vectors,
+        require_normalized=True,
+    )
 
-    if encoded_bitstrings.ndim != 2 or reference_vectors.ndim != 2:
-        raise ValueError("encoded_bitstrings and reference_vectors must be 2D arrays.")
     num_samples = encoded_bitstrings.shape[0]
     n_clusters = reference_vectors.shape[0]
     if n_clusters <= 0:
@@ -939,11 +1134,31 @@ def build_sparse_invalid_pairs(
     reference_vectors: np.ndarray,
 ) -> SparseInvalidPairs:
     """Collect only invalid encoded pairs and their cluster references."""
-    all_encoded_bitstrings = np.asarray(all_encoded_bitstrings, dtype=np.uint8)
-    labels = np.asarray(labels, dtype=np.int64)
-    reference_vectors = np.asarray(reference_vectors, dtype=np.float64)
+    all_encoded_bitstrings = _as_exact_binary_uint8(
+        "all_encoded_bitstrings",
+        all_encoded_bitstrings,
+    )
+    reference_vectors = _as_reference_vectors(
+        "reference_vectors",
+        reference_vectors,
+        require_normalized=True,
+    )
 
     num_samples, n_encoded = all_encoded_bitstrings.shape
+    if n_encoded % 2 != 0:
+        raise ValueError("all_encoded_bitstrings must have an even number of columns.")
+    n_clusters = reference_vectors.shape[0]
+    if n_clusters <= 0:
+        raise ValueError("reference_vectors must contain at least one cluster.")
+    if reference_vectors.shape[1] != n_encoded:
+        raise ValueError(
+            "all_encoded_bitstrings and reference_vectors must have the same width."
+        )
+    labels = _as_cluster_labels(
+        labels,
+        num_samples=num_samples,
+        n_clusters=n_clusters,
+    )
     n_logical = n_encoded // 2
 
     pairs = all_encoded_bitstrings.reshape(num_samples, n_logical, 2)
@@ -987,8 +1202,18 @@ def mrelu_recover_encoded_samples(
     rng: np.random.Generator,
 ) -> RecoveryResult:
     """Run modified-ReLU invalid-pair recovery and return metadata."""
-    recovered = np.asarray(all_encoded_bitstrings, dtype=np.uint8).copy()
-    all_weights = np.asarray(all_weights, dtype=np.float64)
+    recovered = _as_exact_binary_uint8(
+        "all_encoded_bitstrings",
+        all_encoded_bitstrings,
+    ).copy()
+    all_weights = _as_finite_nonnegative_weights("all_weights", all_weights)
+    if all_weights.shape[0] != recovered.shape[0]:
+        raise ValueError(
+            "all_weights must have one entry per encoded sample. "
+            f"Got {all_weights.shape[0]} weights for {recovered.shape[0]} samples."
+        )
+    if not callable(recovery_prob_fn):
+        raise TypeError("recovery_prob_fn must be callable.")
 
     invalid_data = build_sparse_invalid_pairs(recovered, labels, reference_vectors)
     num_invalid_pairs = len(invalid_data.sample_indices)
@@ -1006,15 +1231,17 @@ def mrelu_recover_encoded_samples(
                 f"pair_index={int(invalid_data.pair_indices[0])}, "
                 f"cluster_index={int(invalid_data.cluster_indices[0])}: {exc}"
             ) from exc
-        p_first = np.asarray(p_first, dtype=np.float64)
-
-        if p_first.shape != (num_invalid_pairs,):
+        p_first_raw = np.asarray(p_first)
+        if p_first_raw.shape != (num_invalid_pairs,):
             raise ValueError(
                 "recovery_prob_fn must return p_first with shape "
-                f"({num_invalid_pairs},). Got {p_first.shape}."
+                f"({num_invalid_pairs},). Got {p_first_raw.shape}."
             )
-        if not np.all(np.isfinite(p_first)):
-            raise ValueError("recovery_prob_fn returned non-finite probabilities.")
+        p_first = _as_finite_real_array(
+            "recovery_prob_fn output",
+            p_first_raw,
+            ndim=1,
+        )
         if np.any((p_first < 0.0) | (p_first > 1.0)):
             raise ValueError("recovery_prob_fn must return probabilities in [0, 1].")
 
@@ -1039,6 +1266,8 @@ def mrelu_recover_encoded_samples(
     prob_metadata = _callable_metadata(recovery_prob_fn) or {}
     metadata = {
         "method": "mrelu",
+        "package_version": PACKAGE_VERSION,
+        "algorithm_version": ALGORITHM_VERSION,
         "num_invalid_pairs": int(num_invalid_pairs),
         "num_zero_denominator_errors": 0,
         "num_recovered_unique_samples": int(len(recovered_unique)),
@@ -1055,19 +1284,25 @@ def mrelu_recover_encoded_samples(
 def _validate_recovery_result(result: RecoveryResult, *, n_encoded: int) -> RecoveryResult:
     if not isinstance(result, RecoveryResult):
         raise TypeError("recovery_fn must return a RecoveryResult.")
-    bitstrings = np.asarray(result.bitstrings, dtype=np.uint8)
-    weights = np.asarray(result.weights, dtype=np.float64)
-    if bitstrings.ndim != 2 or bitstrings.shape[1] != n_encoded:
+    bitstrings = _as_exact_binary_uint8(
+        "RecoveryResult.bitstrings",
+        result.bitstrings,
+    )
+    weights = _as_finite_nonnegative_weights(
+        "RecoveryResult.weights",
+        result.weights,
+    )
+    if bitstrings.shape[1] != n_encoded:
         raise ValueError(
             "RecoveryResult.bitstrings must have shape "
             f"(n_recovered, {n_encoded}). Got {bitstrings.shape}."
         )
-    if weights.ndim != 1 or weights.shape[0] != bitstrings.shape[0]:
+    if weights.shape[0] != bitstrings.shape[0]:
         raise ValueError("RecoveryResult.weights must be 1D and match bitstrings.")
-    if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
-        raise ValueError("RecoveryResult.weights must be finite and nonnegative.")
     if not np.all(is_valid_encoded_bitstrings(bitstrings)):
         raise ValueError("RecoveryResult.bitstrings must all satisfy the pair code.")
+    if not isinstance(result.metadata, Mapping):
+        raise TypeError("RecoveryResult.metadata must be a mapping/dict.")
     metadata = dict(result.metadata)
     return RecoveryResult(bitstrings.astype(np.uint8, copy=True), weights, metadata)
 
@@ -1108,13 +1343,44 @@ def _weighted_sample_without_replacement(
     # Use weighted sampling when enough positive-weight rows are available.
     if len(positive_indices) >= n_draw:
         positive_weights = weights[positive_indices]
-        p = positive_weights / positive_weights.sum()
-        chosen_local = rng.choice(
-            len(positive_indices),
-            size=n_draw,
-            replace=False,
-            p=p,
-        )
+        with np.errstate(over="ignore", invalid="ignore"):
+            positive_total = float(np.sum(positive_weights))
+        if math.isfinite(positive_total) and positive_total > 0.0:
+            # Preserve the historical arithmetic for ordinary finite totals.
+            p = positive_weights / positive_total
+        else:
+            # Scale only on overflow so finite large weights remain usable.
+            scale = float(np.max(positive_weights))
+            scaled_weights = positive_weights / scale
+            scaled_total = float(np.sum(scaled_weights))
+            if not math.isfinite(scaled_total) or scaled_total <= 0.0:
+                raise ValueError("positive weights could not be normalized safely.")
+            p = scaled_weights / scaled_total
+        # `Generator.choice(..., replace=False, p=...)` requires at least
+        # `n_draw` strictly positive probabilities. Extremely different finite
+        # magnitudes can underflow during normalization, so fall back to a
+        # uniform draw over the positive-weight rows in that pathological case.
+        representable = np.flatnonzero(p > 0.0)
+        if len(representable) < n_draw:
+            # Preserve every state whose normalized probability remains
+            # representable, then fill only from weights that underflowed to
+            # zero. This keeps a dominant state from being lost to a uniform
+            # fallback over the entire pool.
+            underflowed = np.flatnonzero(p == 0.0)
+            fill = rng.choice(
+                underflowed,
+                size=n_draw - len(representable),
+                replace=False,
+            )
+            chosen_local = np.concatenate([representable, fill])
+            rng.shuffle(chosen_local)
+        else:
+            chosen_local = rng.choice(
+                len(positive_indices),
+                size=n_draw,
+                replace=False,
+                p=p,
+            )
         return positive_indices[chosen_local].astype(np.int64)
 
     # Keep all positive-weight rows and fill the rest uniformly.
@@ -1200,6 +1466,47 @@ def build_one_batch(
     from the recovered logical pool. The batch can be smaller than ``max_dim``
     when the unique eligible pool is insufficient.
     """
+    max_dim = _validate_positive_int("max_dim", max_dim)
+    recovered_logical_pool = _as_exact_binary_uint8(
+        "recovered_logical_pool",
+        recovered_logical_pool,
+    )
+    recovered_weights = _as_finite_nonnegative_weights(
+        "recovered_weights",
+        recovered_weights,
+    )
+    if recovered_weights.shape[0] != recovered_logical_pool.shape[0]:
+        raise ValueError(
+            "recovered_weights must have one entry per recovered logical row."
+        )
+    deterministic_logical_basis = _as_exact_binary_uint8(
+        "deterministic_logical_basis",
+        deterministic_logical_basis,
+    )
+    carryover_logical_basis = _as_exact_binary_uint8(
+        "carryover_logical_basis",
+        carryover_logical_basis,
+    )
+    n_logical = recovered_logical_pool.shape[1]
+    for name, basis in (
+        ("deterministic_logical_basis", deterministic_logical_basis),
+        ("carryover_logical_basis", carryover_logical_basis),
+    ):
+        if basis.shape[1] != n_logical:
+            raise ValueError(
+                f"{name} must have width {n_logical}. Got {basis.shape[1]}."
+            )
+    if forced_valid_initial_logical_basis is not None:
+        forced_valid_initial_logical_basis = _as_exact_binary_uint8(
+            "forced_valid_initial_logical_basis",
+            forced_valid_initial_logical_basis,
+        )
+        if forced_valid_initial_logical_basis.shape[1] != n_logical:
+            raise ValueError(
+                "forced_valid_initial_logical_basis must have width "
+                f"{n_logical}. Got {forced_valid_initial_logical_basis.shape[1]}."
+            )
+
     forced, available_pool, available_weights = _prepare_batch_sampling_inputs(
         recovered_logical_pool,
         recovered_weights,
@@ -1322,14 +1629,37 @@ def select_carryover_basis(
     Rows with ``abs(coefficient) >= carryover_threshold`` are candidates. When
     too many candidates are present, ``np.argpartition`` avoids a full sort.
     """
-    best_logical_basis = np.asarray(best_logical_basis, dtype=np.uint8)
+    best_logical_basis = _as_exact_binary_uint8(
+        "best_logical_basis",
+        best_logical_basis,
+    )
     best_coefficients = np.asarray(best_coefficients)
+    if best_coefficients.ndim != 1:
+        raise ValueError("best_coefficients must be a 1D array.")
+    if not np.issubdtype(best_coefficients.dtype, np.number):
+        raise TypeError(
+            "best_coefficients must have a numeric dtype. "
+            f"Got {best_coefficients.dtype}."
+        )
+    if not np.all(np.isfinite(best_coefficients)):
+        raise ValueError("best_coefficients must contain only finite values.")
+    if best_coefficients.shape[0] != best_logical_basis.shape[0]:
+        raise ValueError(
+            "best_coefficients must have one entry per logical basis row."
+        )
+    carryover_threshold = _validate_unit_interval_real(
+        "carryover_threshold",
+        carryover_threshold,
+    )
+    max_keep = _validate_nonnegative_int("max_keep", max_keep)
 
     if len(best_logical_basis) == 0 or max_keep <= 0:
-        n_logical = best_logical_basis.shape[1] if best_logical_basis.ndim == 2 else 0
-        return np.empty((0, n_logical), dtype=np.uint8)
+        return np.empty((0, best_logical_basis.shape[1]), dtype=np.uint8)
 
-    amplitudes = np.abs(best_coefficients)
+    with np.errstate(over="ignore", invalid="ignore"):
+        amplitudes = np.abs(best_coefficients)
+    if not np.all(np.isfinite(amplitudes)):
+        raise ValueError("Absolute best_coefficients must be finite.")
     candidate_indices = np.flatnonzero(amplitudes >= carryover_threshold)
     if len(candidate_indices) == 0:
         return np.empty((0, best_logical_basis.shape[1]), dtype=np.uint8)
@@ -1361,21 +1691,58 @@ def update_reference_vectors(
     clusters keep their previous reference. ``chunk_size`` is the positive
     number of encoded rows per assignment dispatch.
     """
-    best_logical_basis = np.asarray(best_logical_basis, dtype=np.uint8)
+    chunk_size = _validate_positive_int("chunk_size", chunk_size)
+    best_logical_basis = _as_exact_binary_uint8(
+        "best_logical_basis",
+        best_logical_basis,
+    )
     best_coefficients = np.asarray(best_coefficients)
-    old_reference_vectors = np.asarray(old_reference_vectors, dtype=np.float64)
+    if best_coefficients.ndim != 1:
+        raise ValueError(
+            "best_coefficients must be a 1D array. "
+            f"Got shape {best_coefficients.shape}."
+        )
+    if not np.issubdtype(best_coefficients.dtype, np.number):
+        raise TypeError(
+            "best_coefficients must have a numeric dtype. "
+            f"Got {best_coefficients.dtype}."
+        )
+    if not np.all(np.isfinite(best_coefficients)):
+        raise ValueError("best_coefficients must contain only finite values.")
+    if best_coefficients.shape[0] != best_logical_basis.shape[0]:
+        raise ValueError(
+            "best_coefficients must have one entry per logical basis row."
+        )
+    old_reference_vectors = _as_reference_vectors(
+        "old_reference_vectors",
+        old_reference_vectors,
+        require_normalized=True,
+    )
 
     n_clusters, n_encoded = old_reference_vectors.shape
+    if n_clusters <= 0:
+        raise ValueError("old_reference_vectors must contain at least one cluster.")
+    if best_logical_basis.shape[1] * 2 != n_encoded:
+        raise ValueError(
+            "best_logical_basis width must be half the old reference width. "
+            f"Got {best_logical_basis.shape[1]} and {n_encoded}."
+        )
 
     if len(best_logical_basis) == 0:
         return old_reference_vectors.copy()
 
     encoded_basis = encode_logical_to_valid_encoded(best_logical_basis)
-    coeff_weights = np.abs(best_coefficients).astype(np.float64) ** 2
+    with np.errstate(over="ignore", invalid="ignore"):
+        coeff_weights = np.abs(best_coefficients).astype(np.float64) ** 2
+    if not np.all(np.isfinite(coeff_weights)):
+        raise ValueError("Squared best_coefficients must be finite.")
 
     total_coeff_weight = float(np.sum(coeff_weights))
     if total_coeff_weight <= 0.0 or not math.isfinite(total_coeff_weight):
-        return old_reference_vectors.copy()
+        raise ValueError(
+            "best_coefficients must have a finite positive squared norm "
+            "for a nonempty logical basis."
+        )
     coeff_weights = coeff_weights / total_coeff_weight
 
     labels = assign_to_nearest_reference(
@@ -1463,6 +1830,11 @@ def _call_and_validate_diagonalize_fn(
             "energy, logical_basis, and coefficients."
         )
 
+    if isinstance(result.energy, (bool, np.bool_)) or not isinstance(
+        result.energy,
+        numbers.Real,
+    ):
+        raise TypeError("diagonalize_fn energy must be a real numeric value, not bool.")
     energy = float(result.energy)
     if not math.isfinite(energy):
         raise ValueError("diagonalize_fn returned non-finite energy.")
@@ -1670,7 +2042,14 @@ def _diagonalize_batch_worker(
     stats = getattr(worker_diagonalize_fn, "last_stats", None)
     stats_metadata: dict[str, Any] | None = None
     if stats is not None:
-        stats_metadata = {}
+        stats_metadata = {
+            "package_version": str(
+                getattr(stats, "package_version", PACKAGE_VERSION)
+            ),
+            "algorithm_version": str(
+                getattr(stats, "algorithm_version", ALGORITHM_VERSION)
+            ),
+        }
         for key in (
             "basis_dim",
             "nnz",
@@ -2292,7 +2671,15 @@ def run_code_space_recovery(
     if not hasattr(hamiltonian, "num_qubits"):
         raise TypeError("hamiltonian must have a num_qubits attribute.")
 
-    n_logical = int(hamiltonian.num_qubits)
+    raw_n_logical = hamiltonian.num_qubits
+    if isinstance(raw_n_logical, (bool, np.bool_)) or not isinstance(
+        raw_n_logical, numbers.Integral
+    ):
+        raise TypeError(
+            "hamiltonian.num_qubits must be an integer, not a value that requires "
+            f"coercion; got {raw_n_logical!r}."
+        )
+    n_logical = int(raw_n_logical)
     if n_logical < 1:
         raise ValueError(f"hamiltonian.num_qubits must be >= 1, got {n_logical}.")
     n_encoded = 2 * n_logical
@@ -2497,6 +2884,13 @@ def run_code_space_recovery(
                 # they explicitly opt in to the same contract.
                 draw_logical = draw_logical.astype(np.uint8, copy=True)
                 draw_weights = recovery_result.weights.astype(np.float64, copy=True)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    draw_weight_total = float(np.sum(draw_weights))
+                if not math.isfinite(draw_weight_total):
+                    raise ValueError(
+                        "RecoveryResult weight total must remain finite. A recovery "
+                        "callable that advertises unique rows returned an overflowing sum."
+                    )
             else:
                 draw_logical, draw_weights = _merge_duplicate_rows_sum_weights(
                     draw_logical,
@@ -2653,8 +3047,14 @@ def run_code_space_recovery(
         recovery_metadata["combined_recovered_unique_count"] = int(
             len(recovered_logical)
         )
-        recovery_metadata["combined_recovered_weight_sum"] = float(
-            np.sum(recovered_logical_weights)
+        with np.errstate(over="ignore", invalid="ignore"):
+            combined_recovered_weight_sum = float(
+                np.sum(recovered_logical_weights)
+            )
+        if not math.isfinite(combined_recovered_weight_sum):
+            raise RuntimeError("Combined recovered weight sum became non-finite.")
+        recovery_metadata["combined_recovered_weight_sum"] = (
+            combined_recovered_weight_sum
         )
         recovery_metadata["recovery_draw_metadata"] = recovery_draw_metadata
         recovery_metadata_history.append(recovery_metadata)
@@ -3208,9 +3608,10 @@ def run_code_space_recovery(
 
     config: dict[str, Any] = {
         "function_name": "run_code_space_recovery",
-        "core_name": __core_name__,
+        "core_name": _CORE_NAME,
+        "package_version": PACKAGE_VERSION,
         "module_version": MODULE_VERSION,
-        "core_version": __version__,
+        "core_version": MODULE_VERSION,
         "algorithm_version": ALGORITHM_VERSION,
         "n_logical": n_logical,
         "n_encoded": n_encoded,
@@ -3403,14 +3804,11 @@ def modified_relu_score(
     corner:
         Kink location of the piecewise-linear score. Must lie in ``(0, 1)``.
     """
-    distance = np.asarray(distance, dtype=np.float64)
+    distance = _as_finite_real_array("distance", distance)
     delta = _validate_positive_real("delta", delta)
     if delta > 1.0:
         raise ValueError(f"delta must be <= 1, got {delta}.")
     corner = _validate_relu_corner(corner)
-    if not np.all(np.isfinite(distance)):
-        raise ValueError("distance must contain only finite values.")
-
     return np.where(
         distance <= corner,
         delta * distance / corner,
@@ -3456,21 +3854,23 @@ def make_relu_pair_recovery_prob_fn(
 
         ``p_first[i]`` is the probability of flipping the first rail of pair i.
         """
-        invalid_pair_bits_arr = np.asarray(invalid_pair_bits, dtype=np.uint8)
-        invalid_pair_reference_arr = np.asarray(invalid_pair_reference, dtype=np.float64)
-
-        if invalid_pair_bits_arr.ndim != 2 or invalid_pair_bits_arr.shape[1] != 2:
+        invalid_pair_bits_arr = _as_exact_binary_uint8(
+            "invalid_pair_bits",
+            invalid_pair_bits,
+        )
+        if invalid_pair_bits_arr.shape[1] != 2:
             raise ValueError("invalid_pair_bits must have shape (num_invalid_pairs, 2).")
+        invalid_pair_reference_arr = _as_reference_vectors(
+            "invalid_pair_reference",
+            invalid_pair_reference,
+            require_normalized=True,
+        )
         if invalid_pair_reference_arr.shape != invalid_pair_bits_arr.shape:
             raise ValueError(
                 "invalid_pair_reference must have the same shape as invalid_pair_bits."
             )
-        if not np.all((invalid_pair_bits_arr == 0) | (invalid_pair_bits_arr == 1)):
-            raise ValueError("invalid_pair_bits must contain only 0 or 1.")
-        if not np.all(np.isfinite(invalid_pair_reference_arr)):
-            raise ValueError("invalid_pair_reference must be finite.")
-        if np.any((invalid_pair_reference_arr < 0.0) | (invalid_pair_reference_arr > 1.0)):
-            raise ValueError("invalid_pair_reference must be in [0, 1].")
+        if np.any(invalid_pair_bits_arr[:, 0] != invalid_pair_bits_arr[:, 1]):
+            raise ValueError("invalid_pair_bits rows must be invalid pairs 00 or 11.")
 
         distances = np.abs(
             invalid_pair_bits_arr.astype(np.float64) - invalid_pair_reference_arr
@@ -3497,6 +3897,8 @@ def make_relu_pair_recovery_prob_fn(
     recovery_metadata = {
         "type": "modified_relu_pair_recovery_prob_fn",
         "family": "modified_relu_pair_recovery",
+        "package_version": PACKAGE_VERSION,
+        "algorithm_version": ALGORITHM_VERSION,
         "delta": float(delta),
         "corner": float(corner),
     }
@@ -3534,6 +3936,7 @@ def make_mrelu_recovery_fn(
         "type": "mrelu_recovery_fn",
         "family": "modified_relu_pair_recovery",
         "method": "mrelu",
+        "package_version": PACKAGE_VERSION,
         "algorithm_version": ALGORITHM_VERSION,
         "recovery_prob_fn": getattr(recovery_prob_fn, "__name__", repr(recovery_prob_fn)),
         "recovery_prob_fn_config": dict(prob_metadata),
@@ -3565,3 +3968,26 @@ def make_mrelu_recovery_fn(
     recovery_fn._code_space_recovery_no_invalid_pairs_are_terminal = True  # type: ignore[attr-defined]
     recovery_fn._code_space_recovery_output_rows_are_unique = True  # type: ignore[attr-defined]
     return recovery_fn
+
+
+__all__ = [
+    "DiagonalizationResult",
+    "CodeSpaceRecoveryResult",
+    "RecoveryResult",
+    "SparseInvalidPairs",
+    "encode_logical_to_valid_encoded",
+    "is_valid_encoded_bitstrings",
+    "decode_valid_encoded_to_logical",
+    "pairwise_normalize_reference_vectors",
+    "initialize_reference_vectors",
+    "assign_to_nearest_reference",
+    "build_sparse_invalid_pairs",
+    "mrelu_recover_encoded_samples",
+    "build_one_batch",
+    "select_carryover_basis",
+    "update_reference_vectors",
+    "run_code_space_recovery",
+    "modified_relu_score",
+    "make_relu_pair_recovery_prob_fn",
+    "make_mrelu_recovery_fn",
+]
